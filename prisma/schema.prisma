@@ -1,0 +1,302 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                  String               @id @default(uuid())
+  name                String
+  username            String               @unique
+  email               String               @unique
+  password            String
+  profileImage        String?
+  bio                 String?
+  city                String?
+  latitude            Float?
+  longitude           Float?
+  locationUpdatedAt   DateTime?
+  availabilityStatus  CreatorAvailability  @default(OFFLINE)
+  walletBalance       Decimal              @default(0.00) @db.Decimal(12, 2)
+  fcmToken            String?
+  isActive            Boolean              @default(true)
+  isSuspicious        Boolean              @default(false)
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+  transactions        Transaction[]
+  payoutRequests      PayoutRequest[]
+  notifications       Notification[]
+  savedPlaces         SavedPlace[]
+  searchHistory       SearchHistoryEntry[]
+  requestsCreated     Request[]            @relation("RequesterRequests")
+  requestsFulfilled   Request[]            @relation("CreatorRequests")
+
+  @@index([email])
+  @@index([username])
+  @@index([availabilityStatus])
+}
+
+// Creator's self-reported availability for discovery (PRD §5.5, §5.11). Only ONLINE
+// creators are surfaced nearby-request results; BUSY is set while mid-fulfilment (future
+// phase wires this transition automatically), OFFLINE is the default/manual opt-out.
+enum CreatorAvailability {
+  ONLINE
+  OFFLINE
+  BUSY
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  title     String
+  body      String
+  data      Json?
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+}
+
+model Admin {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String
+  name      String
+  fcmToken  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([email])
+}
+
+enum TransactionType {
+  CREDIT
+  DEBIT
+}
+
+enum TransactionStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+model Transaction {
+  id                String            @id @default(uuid())
+  userId            String
+  user              User              @relation(fields: [userId], references: [id])
+  type              TransactionType
+  amount            Decimal           @db.Decimal(12, 2)
+  status            TransactionStatus @default(PENDING)
+  razorpayOrderId   String?
+  razorpayPaymentId String?
+  description       String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  @@index([userId])
+  @@index([razorpayOrderId])
+}
+
+enum PayoutStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model PayoutRequest {
+  id          String       @id @default(uuid())
+  userId      String
+  user        User         @relation(fields: [userId], references: [id])
+  amount      Decimal      @db.Decimal(12, 2)
+  status      PayoutStatus @default(PENDING)
+  adminNote   String?
+  processedAt DateTime?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([userId])
+  @@index([status])
+}
+
+model RegistrationOtp {
+  id           String   @id @default(uuid())
+  name         String
+  username     String
+  email        String
+  passwordHash String
+  otpHash      String
+  expiresAt    DateTime
+  attempts     Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([email])
+  @@index([expiresAt])
+}
+
+model PasswordResetOtp {
+  id        String   @id @default(uuid())
+  email     String
+  otpHash   String
+  expiresAt DateTime
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([email])
+  @@index([expiresAt])
+}
+
+model SavedPlace {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  placeId   String
+  name      String
+  address   String?
+  latitude  Float
+  longitude Float
+  category  String?
+  label     String?
+  createdAt DateTime @default(now())
+
+  @@unique([userId, placeId])
+  @@index([userId])
+}
+
+enum SearchType {
+  TEXT
+  NEARBY
+  PLACE_SELECT
+}
+
+model SearchHistoryEntry {
+  id             String     @id @default(uuid())
+  userId         String
+  user           User       @relation(fields: [userId], references: [id])
+  query          String?
+  placeId        String?
+  resultSnapshot Json?
+  searchType     SearchType
+  createdAt      DateTime   @default(now())
+
+  @@index([userId])
+  @@index([userId, createdAt])
+}
+
+enum RestrictedLocationCategory {
+  RESTRICTED
+  PROHIBITED
+}
+
+model RestrictedLocation {
+  id           String                     @id @default(uuid())
+  latitude     Float
+  longitude    Float
+  radiusMeters Int
+  category     RestrictedLocationCategory
+  label        String?
+  createdAt    DateTime                   @default(now())
+  updatedAt    DateTime                   @updatedAt
+
+  @@index([category])
+}
+
+// --- Request domain (PRD §5) -------------------------------------------------------------
+// Escrow, chat, creator matching and video recording are separate future domains (see
+// backend/docs/MASTER_EXECUTION_PLAN.md Phases 3-8) and are intentionally not modelled yet.
+// The status enum below still declares all 15 PRD §5.13 states so the state machine module
+// is complete even though only the pre-fulfilment subset of transitions is wired to endpoints.
+
+enum RequestType {
+  IMMEDIATE
+  SCHEDULED
+}
+
+enum RequestCategory {
+  TRAFFIC
+  EVENTS
+  FOOD_DINING
+  PUBLIC_SPACE
+  OTHER
+}
+
+enum LocationCategory {
+  PUBLIC
+  RESTRICTED
+  PROHIBITED
+}
+
+// Exact 15-state enum per PRD §5.13. Do not add convenience states.
+enum RequestStatus {
+  DRAFT
+  PUBLISHED
+  CREATOR_ASSIGNED
+  TEMPORARY_CHAT
+  RECORDING
+  UPLOAD
+  MODERATOR_REVIEW
+  REQUESTER_REVIEW
+  RESHOOT_REQUESTED
+  ACCEPTED
+  PAYMENT_RELEASED
+  COMPLETED
+  REJECTED
+  DISPUTED
+  EXPIRED
+  CANCELLED
+}
+
+model Request {
+  id                       String           @id @default(uuid())
+  requesterId              String
+  requester                User             @relation("RequesterRequests", fields: [requesterId], references: [id])
+  creatorId                String?
+  creator                  User?            @relation("CreatorRequests", fields: [creatorId], references: [id])
+
+  type                     RequestType      @default(IMMEDIATE)
+  scheduledAt              DateTime?
+
+  latitude                 Float
+  longitude                Float
+  formattedAddress         String?
+  locationCategory         LocationCategory
+  radiusMeters             Int              @default(500)
+
+  description              String
+  durationMinutes          Int
+  rewardAmount             Decimal          @db.Decimal(12, 2)
+  category                 RequestCategory
+  instructions             String?
+
+  status                   RequestStatus    @default(DRAFT)
+  highValueReviewRequired  Boolean          @default(false)
+  reshootUsed              Boolean          @default(false)
+
+  requesterDeclarationAt   DateTime
+  acceptedAt               DateTime?
+  acceptanceTimerExpiresAt DateTime?
+  recordingStartedAt       DateTime?
+  uploadedAt               DateTime?
+  moderatorDecisionAt      DateTime?
+  moderatorRejectionReason String?
+  requesterDecisionAt      DateTime?
+  cancelledAt              DateTime?
+  cancellationReason       String?
+
+  expiresAt                DateTime
+  createdAt                DateTime         @default(now())
+  updatedAt                DateTime         @updatedAt
+
+  @@index([requesterId])
+  @@index([creatorId])
+  @@index([status])
+  @@index([expiresAt])
+  @@index([status, expiresAt])
+  @@index([status, latitude, longitude])
+}

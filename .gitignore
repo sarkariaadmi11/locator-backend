@@ -1,0 +1,67 @@
+# Dependencies
+node_modules/
+
+# Build Output
+dist/
+build/
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# Firebase service account credential
+firebase-service-account.json
+
+# lock file
+package-lock.json
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Uploads
+uploads/
+temp/
+
+# Prisma
+prisma/dev.db
+prisma/dev.db-journal
+
+# Coverage
+coverage/
+
+# Cache
+.cache/
+.eslintcache
+
+# TypeScript
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Runtime
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Test Output
+test-results/
+
+# Mac
+.AppleDouble
+.LSOverride
+
+# Misc
+*.swp
+*.swo
