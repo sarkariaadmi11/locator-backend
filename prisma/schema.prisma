@@ -8,31 +8,76 @@ datasource db {
 }
 
 model User {
-  id                  String               @id @default(uuid())
-  name                String
-  username            String               @unique
-  email               String               @unique
-  password            String
-  profileImage        String?
-  bio                 String?
-  city                String?
-  latitude            Float?
-  longitude           Float?
-  locationUpdatedAt   DateTime?
-  availabilityStatus  CreatorAvailability  @default(OFFLINE)
-  walletBalance       Decimal              @default(0.00) @db.Decimal(12, 2)
-  fcmToken            String?
-  isActive            Boolean              @default(true)
-  isSuspicious        Boolean              @default(false)
-  createdAt           DateTime             @default(now())
-  updatedAt           DateTime             @updatedAt
-  transactions        Transaction[]
-  payoutRequests      PayoutRequest[]
-  notifications       Notification[]
-  savedPlaces         SavedPlace[]
-  searchHistory       SearchHistoryEntry[]
-  requestsCreated     Request[]            @relation("RequesterRequests")
-  requestsFulfilled   Request[]            @relation("CreatorRequests")
+  id                 String               @id @default(uuid())
+  name               String
+  username           String               @unique
+  email              String               @unique
+  password           String
+  profileImage       String?
+  bio                String?
+  city               String?
+  latitude           Float?
+  longitude          Float?
+  locationUpdatedAt  DateTime?
+  availabilityStatus CreatorAvailability  @default(OFFLINE)
+  walletBalance      Decimal              @default(0.00) @db.Decimal(12, 2)
+  fcmToken           String?
+  isActive           Boolean              @default(true)
+  isSuspicious       Boolean              @default(false)
+  // Admin-controlled verification flag (backend Phase 10, Trust Profile "Verified Badge") —
+  // no automated KYC/identity check exists yet (KYC fields are a separate, unbuilt Phase 13
+  // item), so this is a manual Admin toggle only, mirroring isActive/isSuspicious.
+  isVerified         Boolean              @default(false)
+  // Notification Preferences (PRD §8.2, backend Phase 12) — 3 independently toggleable
+  // categories. Safety-critical notifications (account suspension, payout rejection) are never
+  // gated by these flags — enforced server-side in notificationService, not just hidden client-
+  // side. Default true (opted-in) so existing users don't silently stop receiving notifications
+  // this phase adds.
+  notifyRequestActivity Boolean           @default(true)
+  notifyPaymentWallet   Boolean           @default(true)
+  notifyPlatformAlerts  Boolean           @default(true)
+  // Trust Profile change-detection snapshot (backend Phase 12) — lets notificationService fire
+  // "Badge Earned"/"Trust Score Updated" only when something actually changed since the last
+  // time this user's own profile was computed, without denormalizing the score/badges
+  // themselves (trustScoreService still computes on demand — see that file). Checked/updated
+  // only on `GET /trust-profile/me` (self-profile fetch), not on every read of this user's
+  // profile by someone else — an interim decision, not a full event-driven recompute on every
+  // score-affecting mutation (see docs/API.md "Notifications").
+  lastNotifiedTrustScore  Int?
+  lastNotifiedTrustBadges String[]        @default([])
+  // Compliance & Data Management (PRD §9, §5.11b.3, backend Phase 13). `consecutiveRejections`
+  // drives the welcome-video re-prompt (resets to 0 on any approved submission, or the moment
+  // `welcomeVideoRepromptPending` is set — see requesterReviewService); mobile clears the flag
+  // via `POST /account/welcome-video-ack` once it has shown the video again.
+  consecutiveRejections       Int       @default(0)
+  welcomeVideoRepromptPending Boolean   @default(false)
+  // Account Deletion workflow (soft delete now, hard delete once the grace period — a
+  // ComplianceConfig-configurable `ACCOUNT_DELETION_GRACE_DAYS` — elapses; see
+  // accountDeletionService/retentionJob). The account stays fully usable during the grace
+  // window so the user can log back in and cancel; only `retentionJob.executeScheduledHardDeletes`
+  // ever clears these two fields (to null, on cancel) or acts on them (at expiry).
+  deletionRequestedAt  DateTime?
+  deletionScheduledFor DateTime?
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+  transactions       Transaction[]
+  payoutRequests     PayoutRequest[]
+  notifications      Notification[]
+  savedPlaces        SavedPlace[]
+  searchHistory      SearchHistoryEntry[]
+  requestsCreated    Request[]            @relation("RequesterRequests")
+  requestsFulfilled  Request[]            @relation("CreatorRequests")
+  chatMessages       ChatMessage[]
+  uploadedVideos     RequestVideo[]       @relation("CreatorUploadedVideos")
+  ratingsGiven       Rating[]             @relation("RatingsGiven")
+  ratingsReceived    Rating[]             @relation("RatingsReceived")
+  reportsFiled       Report[]             @relation("ReportsFiled")
+  reportsReceived    Report[]             @relation("ReportsReceived")
+  disputesRaised     Dispute[]            @relation("DisputesRaised")
+  disputeMessages    DisputeMessage[]     @relation("DisputeMessagesAuthoredByUser")
+  disputeEvidence    DisputeEvidence[]    @relation("DisputeEvidenceUploadedByUser")
+  consentRecords     ConsentRecord[]
+  dataExportRequests DataExportRequest[]
 
   @@index([email])
   @@index([username])
@@ -63,15 +108,41 @@ model Notification {
 }
 
 model Admin {
-  id        String   @id @default(uuid())
-  email     String   @unique
-  password  String
-  name      String
-  fcmToken  String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id               String            @id @default(uuid())
+  email            String            @unique
+  password         String
+  name             String
+  fcmToken         String?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  moderatedVideos  RequestVideo[]
+  auditLogs        AdminAuditLog[]
+  resolvedReports  Report[]
+  resolvedDisputes Dispute[]         @relation("DisputeResolvedByAdmin")
+  ownedDisputes    Dispute[]         @relation("DisputeCaseOwner")
+  disputeMessages  DisputeMessage[]  @relation("DisputeMessagesAuthoredByAdmin")
+  disputeEvidence  DisputeEvidence[] @relation("DisputeEvidenceUploadedByAdmin")
 
   @@index([email])
+}
+
+// Immutable action log (PRD §5.14.7, backend Phase 6/11 — this pass only writes Moderation
+// actions; block/suspicious/payout backfill is a later Phase 11 item, not this milestone).
+// Moderator is a capability, not a separate JWT namespace (docs/CLAUDE.md §1/§7 decision) — so
+// `actorId` always points at an `Admin` row acting in either an Admin or Moderator capacity.
+model AdminAuditLog {
+  id               String   @id @default(uuid())
+  actorId          String
+  actor            Admin    @relation(fields: [actorId], references: [id])
+  action           String
+  targetEntityType String
+  targetEntityId   String
+  metadata         Json?
+  createdAt        DateTime @default(now())
+
+  @@index([actorId])
+  @@index([targetEntityType, targetEntityId])
+  @@index([createdAt])
 }
 
 enum TransactionType {
@@ -95,11 +166,17 @@ model Transaction {
   razorpayOrderId   String?
   razorpayPaymentId String?
   description       String?
+  // Escrow-driven ledger rows reference the originating Request (backend Phase 8) — deposit/
+  // withdraw transactions leave this null, matching CLAUDE.md §2's "must reference requestId
+  // via RequestEscrow, not float free" instruction.
+  requestId         String?
+  request           Request?          @relation(fields: [requestId], references: [id])
   createdAt         DateTime          @default(now())
   updatedAt         DateTime          @updatedAt
 
   @@index([userId])
   @@index([razorpayOrderId])
+  @@index([requestId])
 }
 
 enum PayoutStatus {
@@ -253,32 +330,46 @@ enum RequestStatus {
 }
 
 model Request {
-  id                       String           @id @default(uuid())
-  requesterId              String
-  requester                User             @relation("RequesterRequests", fields: [requesterId], references: [id])
-  creatorId                String?
-  creator                  User?            @relation("CreatorRequests", fields: [creatorId], references: [id])
+  id          String  @id @default(uuid())
+  requesterId String
+  requester   User    @relation("RequesterRequests", fields: [requesterId], references: [id])
+  creatorId   String?
+  creator     User?   @relation("CreatorRequests", fields: [creatorId], references: [id])
 
-  type                     RequestType      @default(IMMEDIATE)
-  scheduledAt              DateTime?
+  type        RequestType @default(IMMEDIATE)
+  scheduledAt DateTime?
 
-  latitude                 Float
-  longitude                Float
-  formattedAddress         String?
-  locationCategory         LocationCategory
-  radiusMeters             Int              @default(500)
+  latitude         Float
+  longitude        Float
+  formattedAddress String?
+  locationCategory LocationCategory
+  radiusMeters     Int              @default(500)
 
-  description              String
-  durationMinutes          Int
-  rewardAmount             Decimal          @db.Decimal(12, 2)
-  category                 RequestCategory
-  instructions             String?
+  description     String
+  durationMinutes Int
+  rewardAmount    Decimal         @db.Decimal(12, 2)
+  category        RequestCategory
+  instructions    String?
 
-  status                   RequestStatus    @default(DRAFT)
-  highValueReviewRequired  Boolean          @default(false)
-  reshootUsed              Boolean          @default(false)
+  status                  RequestStatus @default(DRAFT)
+  highValueReviewRequired Boolean       @default(false)
+  reshootUsed             Boolean       @default(false)
+  reshootCount            Int           @default(0)
+  chatFlaggedForReview    Boolean       @default(false)
+
+  // Trust Profile support (backend Phase 10). `creatorId` gets nulled by the acceptance-timer
+  // sweep when a Creator never starts recording in time (see acceptanceTimerJob) — that's
+  // correct for matching/discovery, but it erases the Creator's fulfilment history from
+  // `creatorId`-based queries. `lastAssignedCreatorId` is stamped once at accept() and never
+  // cleared, so a Creator's trust stats (completion/cancellation/reshoot/response rate) stay
+  // computable after a timeout. `creatorTimedOut` is the Creator-side "abandoned after
+  // accepting" signal (this milestone's analogue of the Requester's `CANCELLED` state, which a
+  // Creator has no equivalent action for).
+  lastAssignedCreatorId String?
+  creatorTimedOut       Boolean @default(false)
 
   requesterDeclarationAt   DateTime
+  creatorDeclarationAt     DateTime?
   acceptedAt               DateTime?
   acceptanceTimerExpiresAt DateTime?
   recordingStartedAt       DateTime?
@@ -286,17 +377,494 @@ model Request {
   moderatorDecisionAt      DateTime?
   moderatorRejectionReason String?
   requesterDecisionAt      DateTime?
+  requesterReviewRemarks   String?
+  requesterRejectionReason String?
+  reshootReason            String?
   cancelledAt              DateTime?
   cancellationReason       String?
 
-  expiresAt                DateTime
-  createdAt                DateTime         @default(now())
-  updatedAt                DateTime         @updatedAt
+  // Notification reminder sweep bookkeeping (backend Phase 12, notificationReminderJob) — each
+  // is stamped once a reminder actually fires, so the sweep never re-notifies for the same
+  // pending state. Additive, mirrors the `creatorTimedOut`-style bookkeeping fields above.
+  recordingReminderSentAt DateTime?
+  reviewReminderSentAt    DateTime?
+  ratingReminderSentAt    DateTime?
+
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  chatMessages ChatMessage[]
+  videos       RequestVideo[]
+  transactions Transaction[]
+  escrow       RequestEscrow?
+  ratings      Rating[]
+  reports      Report[]
+  dispute      Dispute?
+  consentRecords ConsentRecord[]
 
   @@index([requesterId])
   @@index([creatorId])
+  @@index([lastAssignedCreatorId])
   @@index([status])
   @@index([expiresAt])
   @@index([status, expiresAt])
   @@index([status, latitude, longitude])
+}
+
+// Escrow & Payment Release (PRD §7.1, §7.2, §5.2, §5.14.5, backend Phase 8). One row per
+// Request, created (RESERVED) the moment the requester's reward is debited from their wallet at
+// request creation. `commissionRate` is snapshotted at reservation time so a later change to the
+// platform-wide rate never retroactively changes an already-reserved escrow's split (per
+// CLAUDE.md §2's explicit instruction). FROZEN (dispute opened, still-RESERVED funds held) and
+// SPLIT (dispute resolved as a partial settlement) are driven by the Dispute Center (backend
+// Phase 11, see `Dispute` below) — `disputeService`/`escrowService.freeze` are the only writers.
+enum EscrowState {
+  RESERVED
+  RELEASED
+  REFUNDED
+  FROZEN
+  SPLIT
+}
+
+model RequestEscrow {
+  id        String  @id @default(uuid())
+  requestId String  @unique
+  request   Request @relation(fields: [requestId], references: [id])
+
+  amountLocked     Decimal  @db.Decimal(12, 2)
+  commissionRate   Decimal  @db.Decimal(5, 2)
+  commissionAmount Decimal  @db.Decimal(12, 2)
+  creatorEarnings  Decimal  @db.Decimal(12, 2)
+  refundAmount     Decimal? @db.Decimal(12, 2)
+
+  state      EscrowState @default(RESERVED)
+  reservedAt DateTime    @default(now())
+  releasedAt DateTime?
+  refundedAt DateTime?
+  settledAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([state])
+}
+
+// Temporary per-request chat (PRD §5.4). Opens automatically the moment acceptance completes
+// (status -> TEMPORARY_CHAT), closes permanently — no more sends accepted — once the Creator
+// starts recording (status -> RECORDING+). `blocked` rows are logged for moderation audit even
+// though they're never delivered to the other participant (see chatService#list filtering).
+model ChatMessage {
+  id          String   @id @default(uuid())
+  requestId   String
+  request     Request  @relation(fields: [requestId], references: [id])
+  senderId    String
+  sender      User     @relation(fields: [senderId], references: [id])
+  body        String
+  blocked     Boolean  @default(false)
+  blockReason String?
+  createdAt   DateTime @default(now())
+
+  @@index([requestId, createdAt])
+  @@index([requestId, blocked])
+}
+
+// Recording & Upload pipeline (PRD §5.6, §4.4, backend Phase 5). Storage for this milestone
+// is Cloudinary only, behind `IVideoStorageProvider` (see src/services/storage/) — nothing in
+// requestService/recordingService references Cloudinary directly, so a future
+// `S3VideoStorageProvider` swap needs no business-logic changes. `storageProvider` is
+// persisted per row so a future provider migration doesn't orphan videos already uploaded to
+// the old one.
+enum VideoUploadStatus {
+  PENDING
+  UPLOADING
+  UPLOADED
+  FAILED
+  CANCELLED
+}
+
+// Manual Moderation Workflow (PRD §5.9, §4.5, §5.14.7, backend Phase 6). A video only becomes
+// moderatable once its upload lifecycle (`status`) reaches UPLOADED — this field is the
+// separate moderator decision on that same row, not a replacement for `status`.
+enum VideoModerationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// PRD §7.3's rejection-reason table — each reason maps to a distinct downstream handling in
+// moderationService (see docs/API.md "Moderation"); do not collapse to a single blanket reason.
+enum VideoRejectionReason {
+  CONTENT_VIOLATION
+  PROHIBITED_LOCATION
+  GPS_MISMATCH
+  DURATION_MISMATCH
+  FAKE_RECORDING
+  OTHER
+}
+
+model RequestVideo {
+  id        String  @id @default(uuid())
+  requestId String
+  request   Request @relation(fields: [requestId], references: [id])
+  creatorId String
+  creator   User    @relation("CreatorUploadedVideos", fields: [creatorId], references: [id])
+
+  status          VideoUploadStatus @default(PENDING)
+  storageProvider String            @default("cloudinary")
+  storagePublicId String?
+  secureUrl       String?
+  thumbnailUrl    String?
+
+  durationSeconds Float?
+  width           Int?
+  height          Int?
+  fileSizeBytes   Int?
+  mimeType        String?
+
+  gpsLatitude  Float?
+  gpsLongitude Float?
+  recordedAt   DateTime?
+
+  uploadAttempts Int     @default(0)
+  failureReason  String?
+
+  moderationStatus          VideoModerationStatus @default(PENDING)
+  moderationRejectionReason VideoRejectionReason?
+  moderationRemarks         String?
+  moderatedAt               DateTime?
+  moderatedByAdminId        String?
+  moderatedByAdmin          Admin?                @relation(fields: [moderatedByAdminId], references: [id])
+
+  // Data retention (PRD §9, backend Phase 13) — stamped by `retentionJob` once the asset itself
+  // has been deleted from Cloudinary and the URLs nulled out; the row (and its metadata) is kept
+  // forever as the audit trail, only the media asset is purged.
+  assetPurgedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([requestId])
+  @@index([requestId, status])
+  @@index([creatorId])
+  @@index([status, moderationStatus])
+  @@index([moderatedByAdminId])
+}
+
+// --- Ratings, Reviews & Reporting (PRD §5.12, §4.6, backend Phase 9) ---------------------
+
+// Which direction a given Rating row represents — a completed Request always produces up to
+// two Rating rows (one each way), never more than one per direction (see the unique constraint
+// below, which is the DB-level enforcement of "one rating per participant").
+enum RatingRole {
+  REQUESTER_RATES_CREATOR
+  CREATOR_RATES_REQUESTER
+}
+
+// Mutual rating, only reachable once a Request reaches COMPLETED. No edit/delete path exists
+// anywhere in this codebase for this model — "no editing after submission" is enforced by
+// omission, not a flag. A user's overall average/count is computed on demand via
+// ratingRepository.aggregateForUser (see ratingService) rather than denormalized onto `User`,
+// so there is exactly one source of truth for it.
+model Rating {
+  id         String     @id @default(uuid())
+  requestId  String
+  request    Request    @relation(fields: [requestId], references: [id])
+  raterId    String
+  rater      User       @relation("RatingsGiven", fields: [raterId], references: [id])
+  rateeId    String
+  ratee      User       @relation("RatingsReceived", fields: [rateeId], references: [id])
+  role       RatingRole
+  stars      Int
+  reviewText String?
+  createdAt  DateTime   @default(now())
+
+  @@unique([requestId, raterId])
+  @@index([rateeId])
+  @@index([requestId])
+}
+
+// PRD §5.12's exact category taxonomy — do not collapse into a single blanket "other".
+enum ReportCategory {
+  PRIVACY_ISSUE
+  WRONG_LOCATION
+  ABUSE
+  FAKE_RECORDING
+  COPYRIGHT
+  OTHER
+}
+
+// Doubles as both the report's own lifecycle and the Admin review outcome — every transition
+// out of PENDING here IS an Admin decision (resolve/dismiss), so a separate "admin review
+// status" field would just duplicate this one rather than track anything distinct.
+enum ReportStatus {
+  PENDING
+  RESOLVED
+  DISMISSED
+}
+
+// Report/Abuse workflow (PRD §5.12, backend Phase 9). Tied to the Request the report concerns
+// (mirrors how Ratings work) — reporterId+reportedUserId+requestId is the duplicate-prevention
+// key (`@@unique` below). 3+ PENDING/RESOLVED reports against one user within 30 days trips the
+// suspend-recommendation hook in reportService, which reuses the existing `User.isSuspicious`
+// flag/Admin toggle rather than inventing a second suspension mechanism.
+model Report {
+  id                String         @id @default(uuid())
+  reporterId        String
+  reporter          User           @relation("ReportsFiled", fields: [reporterId], references: [id])
+  reportedUserId    String
+  reportedUser      User           @relation("ReportsReceived", fields: [reportedUserId], references: [id])
+  requestId         String
+  request           Request        @relation(fields: [requestId], references: [id])
+  category          ReportCategory
+  description       String
+  evidence          String[]
+  status            ReportStatus   @default(PENDING)
+  resolutionNotes   String?
+  resolvedByAdminId String?
+  resolvedByAdmin   Admin?         @relation(fields: [resolvedByAdminId], references: [id])
+  resolvedAt        DateTime?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  @@unique([reporterId, reportedUserId, requestId])
+  @@index([reportedUserId])
+  @@index([status])
+  @@index([reportedUserId, createdAt])
+}
+
+// --- Dispute Center (PRD §5.14.2, §5.14.3, §5.14.6, §5.14.8, §5.14.10, §4.9, backend Phase 11) --
+// Admin arbitration for a Request that left the normal happy path — a Requester rejection, or
+// either party disputing an already-ACCEPTED/PAYMENT_RELEASED/COMPLETED (paid-out) request, per
+// this milestone's explicit business rule. One Dispute per Request (`@@unique` below); a
+// resolved/closed case can be reopened (see DisputeStatus) instead of creating a second row, so
+// the full message/evidence/resolution history stays on one case.
+//
+// Money-movement is delta-based against a snapshot taken at creation time
+// (`amountLocked`/`commissionRate`/`alreadyReleasedToCreator`/`alreadyRefundedToRequester`)
+// rather than assuming the escrow is still RESERVED — since a dispute can legally be raised
+// after the video was already accepted+paid (COMPLETED, escrow RELEASED) or already refunded
+// (REJECTED, escrow REFUNDED), resolution must be able to reverse an already-settled outcome,
+// not just release/refund a still-frozen one. See disputeService for the delta math.
+enum DisputeReason {
+  VIDEO_QUALITY_ISSUE
+  LOCATION_MISMATCH
+  LATE_DELIVERY
+  PAYMENT_ISSUE
+  INAPPROPRIATE_CONTENT
+  NO_SHOW
+  OTHER
+}
+
+// OPEN -> UNDER_REVIEW (case-owner assigned) -> RESOLVED (money moved) -> CLOSED (case fully
+// archived) -> REOPENED (per this milestone's explicit "reopen if PRD allows" ask — an interim
+// decision, not PRD-sourced; flagged in docs/CLAUDE.md convention, see MASTER_EXECUTION_PLAN.md).
+enum DisputeStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED
+  CLOSED
+  REOPENED
+}
+
+enum DisputeResolution {
+  REQUESTER_FAVOUR
+  CREATOR_FAVOUR
+  PARTIAL
+}
+
+enum DisputeParticipantType {
+  REQUESTER
+  CREATOR
+  ADMIN
+}
+
+model Dispute {
+  id           String                 @id @default(uuid())
+  requestId    String                 @unique
+  request      Request                @relation(fields: [requestId], references: [id])
+  raisedById   String
+  raisedBy     User                   @relation("DisputesRaised", fields: [raisedById], references: [id])
+  raisedByRole DisputeParticipantType
+  reason       DisputeReason
+  description  String
+  status       DisputeStatus          @default(OPEN)
+
+  // Money-movement snapshot taken at creation — see file-level comment above.
+  amountLocked               Decimal     @db.Decimal(12, 2)
+  commissionRate             Decimal     @db.Decimal(5, 2)
+  escrowStateAtCreation      EscrowState
+  alreadyReleasedToCreator   Decimal     @default(0.00) @db.Decimal(12, 2)
+  alreadyRefundedToRequester Decimal     @default(0.00) @db.Decimal(12, 2)
+
+  resolution        DisputeResolution?
+  splitPercentage   Decimal?           @db.Decimal(5, 2)
+  resolutionNotes   String?
+  resolvedAt        DateTime?
+  resolvedByAdminId String?
+  resolvedByAdmin   Admin?             @relation("DisputeResolvedByAdmin", fields: [resolvedByAdminId], references: [id])
+
+  caseOwnerAdminId String?
+  caseOwnerAdmin   Admin?  @relation("DisputeCaseOwner", fields: [caseOwnerAdminId], references: [id])
+
+  closedAt    DateTime?
+  reopenCount Int       @default(0)
+  reopenedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages DisputeMessage[]
+  evidence DisputeEvidence[]
+
+  @@index([status])
+  @@index([raisedById])
+  @@index([caseOwnerAdminId])
+  @@index([createdAt])
+}
+
+// Case communication thread — participants and Admin/Moderator share one timeline.
+// `isInternalNote` rows (Admin-only) are filtered out of the participant-facing message list,
+// mirroring how ChatMessage's `blocked` rows are filtered from participants but kept for audit.
+model DisputeMessage {
+  id             String                 @id @default(uuid())
+  disputeId      String
+  dispute        Dispute                @relation(fields: [disputeId], references: [id])
+  authorType     DisputeParticipantType
+  authorUserId   String?
+  authorUser     User?                  @relation("DisputeMessagesAuthoredByUser", fields: [authorUserId], references: [id])
+  authorAdminId  String?
+  authorAdmin    Admin?                 @relation("DisputeMessagesAuthoredByAdmin", fields: [authorAdminId], references: [id])
+  body           String
+  isInternalNote Boolean                @default(false)
+  createdAt      DateTime               @default(now())
+
+  @@index([disputeId, createdAt])
+}
+
+// Requester/Creator/Admin evidence uploads (images or PDFs), Cloudinary-backed (see
+// disputeService — mirrors profileService's inline `uploadToCloudinary` pattern, not the
+// video-specific `IVideoStorageProvider`, since evidence isn't a swappable-provider concern).
+model DisputeEvidence {
+  id                String                 @id @default(uuid())
+  disputeId         String
+  dispute           Dispute                @relation(fields: [disputeId], references: [id])
+  uploadedByType    DisputeParticipantType
+  uploadedByUserId  String?
+  uploadedByUser    User?                  @relation("DisputeEvidenceUploadedByUser", fields: [uploadedByUserId], references: [id])
+  uploadedByAdminId String?
+  uploadedByAdmin   Admin?                 @relation("DisputeEvidenceUploadedByAdmin", fields: [uploadedByAdminId], references: [id])
+  url               String
+  mimeType          String?
+  caption           String?
+  createdAt         DateTime               @default(now())
+
+  @@index([disputeId])
+}
+
+// --- Compliance, Consent, Privacy & Data Retention (PRD §9, §5.7.3, §5.11b, backend Phase 13) --
+
+// First-login consent (ToS/Privacy Policy/Community Guidelines/Recording Policy) plus per-request
+// Requester/Creator declarations. The latter two are written *additively*, alongside the existing
+// `Request.requesterDeclarationAt`/`creatorDeclarationAt` timestamps (backend Phases 2/5's interim
+// substitute) — this phase does not remove or replace those fields, it just also inserts the
+// immutable audit row the PRD's §9.1/§5.7.3 "insert-only ConsentRecord" requirement asks for.
+enum ConsentType {
+  TERMS_OF_SERVICE
+  PRIVACY_POLICY
+  COMMUNITY_GUIDELINES
+  RECORDING_POLICY
+  REQUESTER_DECLARATION
+  CREATOR_DECLARATION
+}
+
+// Immutable — insert-only, no update/delete code path exists anywhere in this codebase for this
+// model (PRD §9.1's explicit requirement). `version` is stamped from `ComplianceConfig` at the
+// moment of acceptance, never client-supplied, so a user can never claim to have accepted a
+// version that didn't exist yet.
+model ConsentRecord {
+  id         String      @id @default(uuid())
+  userId     String
+  user       User        @relation(fields: [userId], references: [id])
+  type       ConsentType
+  version    String
+  requestId  String?
+  request    Request?    @relation(fields: [requestId], references: [id])
+  ipAddress  String?
+  userAgent  String?
+  acceptedAt DateTime    @default(now())
+
+  @@index([userId, type])
+  @@index([requestId])
+  @@index([acceptedAt])
+}
+
+// Admin-configurable retention windows / consent versions / grace periods (PRD §5.14.8-style
+// "configurable, not hardcoded" pattern already used for proximity radius/acceptance timer/
+// commission elsewhere in this codebase — see `complianceConfigService` for the self-seeding
+// default map and every `[REVIEW]`-tagged number it carries forward from CLAUDE.md §4).
+model ComplianceConfig {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  value       String
+  description String?
+  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now())
+}
+
+enum DataExportStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+// Right-to-access data export (PRD §9, DPDP-style). Generated synchronously today (no job-queue
+// lib in this stack — same pragmatic in-process pattern used everywhere else here); `fileUrl`
+// points at a Cloudinary-hosted JSON bundle (raw resource, not the video `IVideoStorageProvider`
+// abstraction — mirrors how `DisputeEvidence` uploads are a one-off inline uploader, not a
+// swappable-provider concern) and `expiresAt` bounds how long the download link stays valid.
+model DataExportRequest {
+  id            String           @id @default(uuid())
+  userId        String
+  user          User             @relation(fields: [userId], references: [id])
+  status        DataExportStatus @default(PENDING)
+  fileUrl       String?
+  failureReason String?
+  requestedAt   DateTime         @default(now())
+  completedAt   DateTime?
+  expiresAt     DateTime?
+
+  @@index([userId])
+  @@index([status])
+}
+
+// Every destructive/anonymizing Data Management action (account hard-delete, chat/video/
+// notification retention purges, inactive-account/expired-draft cleanup) writes exactly one of
+// these rows — immutable, insert-only, the audit trail for "what got deleted and why" (PRD §9's
+// "data deletion logs" requirement), independent of `AdminAuditLog` (which is Admin-actor-only;
+// most of these are system/scheduled-job actions with no Admin actor).
+enum DeletionLogAction {
+  ACCOUNT_DELETION_REQUESTED
+  ACCOUNT_DELETION_CANCELLED
+  ACCOUNT_HARD_DELETED
+  CHAT_MESSAGES_PURGED
+  VIDEO_ASSET_PURGED
+  NOTIFICATIONS_PURGED
+  INACTIVE_ACCOUNT_CLEANED
+  EXPIRED_DRAFT_CLEANED
+}
+
+model DataDeletionLog {
+  id         String             @id @default(uuid())
+  userId     String?
+  action     DeletionLogAction
+  entityType String
+  entityId   String?
+  metadata   Json?
+  createdAt  DateTime           @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
 }

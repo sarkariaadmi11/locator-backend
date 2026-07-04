@@ -7,7 +7,8 @@ import {logger} from '../config/logger';
 import {prisma} from '../prisma/client';
 import {payoutRequestRepository} from '../repositories/payoutRequestRepository';
 import {transactionRepository} from '../repositories/transactionRepository';
-import {fcmService} from './fcmService';
+import {notificationService} from './notificationService';
+import {NotificationType} from './notificationTypes';
 import {HttpError} from '../utils/httpError';
 import {presentUser} from '../utils/userPresenter';
 
@@ -234,11 +235,12 @@ export const walletService = {
       amount,
     });
 
-    await fcmService.sendToAllAdmins({
-      title: 'New Withdrawal Request',
-      body: `${user.name} has requested a withdrawal of ₹${amount.toFixed(2)}.`,
-      data: {type: 'PAYOUT_REQUEST', userId, amount: String(amount), webRoute: '/payouts'},
-    });
+    await notificationService.notifyAdmins(
+      NotificationType.PAYOUT_REQUEST,
+      'New Withdrawal Request',
+      `${user.name} has requested a withdrawal of ₹${amount.toFixed(2)}.`,
+      {userId, amount: String(amount), webRoute: '/payouts'},
+    );
 
     return {message: 'Payout request submitted. An admin will process it shortly.'};
   },
@@ -253,7 +255,7 @@ export const walletService = {
         orderBy: {createdAt: 'desc'},
         skip,
         take: limit,
-        select: {id: true, type: true, amount: true, description: true, createdAt: true},
+        select: {id: true, type: true, amount: true, description: true, requestId: true, createdAt: true},
       }),
       transactionRepository.count(where),
     ]);

@@ -6,11 +6,16 @@ import {userRepository} from '../repositories/userRepository';
 import {haversineMeters} from '../utils/geo';
 import {HttpError} from '../utils/httpError';
 import {presentRequest} from '../utils/requestPresenter';
+import {consentService} from './consentService';
 import {creatorLockKey, creatorLockService} from './creatorLockService';
 import {creatorMatchingService, NearbyFilters} from './creatorMatchingService';
-import {fcmService} from './fcmService';
+import {escrowService} from './escrowService';
 import {locationCategoryService} from './locationCategoryService';
+import {notificationService} from './notificationService';
+import {NotificationType} from './notificationTypes';
 import {placesService} from './placesService';
+import {ratingService} from './ratingService';
+import {trustScoreService} from './trustScoreService';
 import {
   REQUEST_EXPIRY_HOURS,
   REQUEST_HIGH_VALUE_THRESHOLD,
@@ -44,14 +49,38 @@ export async function notifyEligibleCreatorsOfNewRequest(request: Awaited<Return
   try {
     const eligible = await creatorMatchingService.findEligibleCreatorsForRequest(request);
     if (eligible.length === 0) return;
-    await fcmService.sendToMultiple(eligible.map(creator => creator.id), {
-      title: 'New Request Near You',
-      body: `₹${Number(request.rewardAmount)} · ${request.description.slice(0, 80)}`,
-      data: {type: 'REQUEST_PUBLISHED', requestId: request.id},
-    });
+    await notificationService.notifyMultiple(
+      eligible.map(creator => creator.id),
+      NotificationType.REQUEST_PUBLISHED,
+      'New Request Near You',
+      `₹${Number(request.rewardAmount)} · ${request.description.slice(0, 80)}`,
+      {requestId: request.id, screen: 'CreatorRequestDetail'},
+    );
+    // "Nearby Creator Found" (PRD §8.1 Requests matrix) — reassures the Requester that
+    // eligible creators actually exist nearby, distinct from the creator-facing broadcast above.
+    await notificationService.notifyUser(
+      request.requesterId,
+      NotificationType.NEARBY_CREATOR_FOUND,
+      'Nearby creators found',
+      `${eligible.length} creator${eligible.length === 1 ? '' : 's'} nearby can fulfil your request.`,
+      {requestId: request.id, screen: 'RequestDetail'},
+    );
   } catch {
     // Notification delivery must never block or fail request publication.
   }
+}
+
+/**
+ * Creator Discovery (nearby/available feeds) shows only the Requester's trust profile — these
+ * lists are `PUBLISHED`-only (pre-acceptance, see creatorMatchingService/findAvailable), so
+ * there's never a Creator side to show yet.
+ */
+async function attachRequesterTrustProfile<T extends object>(
+  base: T,
+  request: {requesterId: string},
+): Promise<T & {requesterTrustProfile: Awaited<ReturnType<typeof trustScoreService.getProfile>>}> {
+  const requesterTrustProfile = await trustScoreService.getProfile(request.requesterId, 'requester');
+  return {...base, requesterTrustProfile};
 }
 
 async function resolveFormattedAddress(
@@ -72,6 +101,18 @@ async function resolveFormattedAddress(
 
 export const requestService = {
   async create(requesterId: string, input: CreateRequestInput) {
+    // Escrow reservation (backend Phase 8) debits the full reward amount up front, so a
+    // requester without sufficient funds is blocked before a Request row (or its escrow) ever
+    // exists — checked here, ahead of the atomic reserve, to avoid an orphaned Request on
+    // insufficient balance (see escrowService.reserve for the actual debit).
+    const requester = await userRepository.findById(requesterId);
+    if (!requester) {
+      throw new HttpError(404, 'User not found.');
+    }
+    if (Number(requester.walletBalance) < input.rewardAmount) {
+      throw new HttpError(402, 'Insufficient wallet balance to reserve escrow for this request.');
+    }
+
     const classification = await locationCategoryService.classify(input.latitude, input.longitude);
 
     if (classification.category === 'PROHIBITED') {
@@ -117,6 +158,37 @@ export const requestService = {
       status: 'DRAFT',
     });
 
+    await escrowService.reserve(created.id, requesterId, input.rewardAmount);
+
+    // Immutable consent audit row (PRD §9.1, §5.7.3, backend Phase 13) — additive alongside the
+    // `requesterDeclarationAt` timestamp stamped above (Phase 2's interim substitute, unchanged).
+    await consentService.recordDeclaration(requesterId, 'REQUESTER_DECLARATION', created.id);
+
+    await notificationService.notifyUser(
+      requesterId,
+      NotificationType.REQUEST_CREATED,
+      'Request created',
+      `Your request for ₹${input.rewardAmount} has been created.`,
+      {requestId: created.id, screen: 'RequestDetail'},
+    );
+    if (input.type === 'SCHEDULED' && input.scheduledAt) {
+      await notificationService.notifyUser(
+        requesterId,
+        NotificationType.REQUEST_SCHEDULED,
+        'Request scheduled',
+        `Your request is scheduled for ${input.scheduledAt.toLocaleString()}.`,
+        {requestId: created.id, screen: 'RequestDetail'},
+      );
+    }
+    if (highValueReviewRequired) {
+      await notificationService.notifyAdmins(
+        NotificationType.HIGH_VALUE_ESCROW,
+        'High-value request pending review',
+        `A request worth ₹${input.rewardAmount} requires Admin review before publishing.`,
+        {requestId: created.id},
+      );
+    }
+
     // Immediate, non-high-value requests publish straight away; SCHEDULED and high-value
     // requests stay DRAFT (the former until scheduledAt via the sweep job, the latter
     // pending mandatory Admin review — Phase 6, not yet built — see MASTER_EXECUTION_PLAN.md).
@@ -135,7 +207,8 @@ export const requestService = {
     if (!request) {
       throw new HttpError(404, 'Request not found.');
     }
-    return presentRequest(request);
+    const withRatings = await ratingService.attachRatingSummaries(presentRequest(request), request);
+    return trustScoreService.attachTrustSummaries(withRatings, request);
   },
 
   async listMine(requesterId: string, status: RequestStatus | undefined, page: number, limit: number) {
@@ -176,11 +249,23 @@ export const requestService = {
     // are out of this domain's scope — cancellation there belongs to the fulfilment phase.
     assertTransition(request.status, 'CANCELLED');
 
+    // Refund before flipping status, not after — if the refund fails, the request stays in its
+    // original (still-cancellable) status rather than landing in a CANCELLED-but-unrefunded state.
+    await escrowService.refund(id);
+
     const updated = await requestRepository.update(id, {
       status: 'CANCELLED',
       cancelledAt: new Date(),
       cancellationReason: reason,
     });
+
+    await notificationService.notifyUser(
+      requesterId,
+      NotificationType.REQUEST_CANCELLED,
+      'Request cancelled',
+      'Your request has been cancelled and the escrowed amount refunded.',
+      {requestId: id, screen: 'RequestDetail'},
+    );
 
     return presentRequest(updated);
   },
@@ -199,8 +284,13 @@ export const requestService = {
     }
 
     // Idempotent acceptance: the same Creator retrying (e.g. a lost response after a network
-    // blip) sees the same success result, not a false conflict.
-    if (request.status === 'CREATOR_ASSIGNED' && request.creatorId === creatorId) {
+    // blip) sees the same success result, not a false conflict. CREATOR_ASSIGNED is transient
+    // (this same call advances it straight to TEMPORARY_CHAT below), so a retry will usually
+    // observe TEMPORARY_CHAT rather than CREATOR_ASSIGNED.
+    if (
+      (request.status === 'CREATOR_ASSIGNED' || request.status === 'TEMPORARY_CHAT') &&
+      request.creatorId === creatorId
+    ) {
       return presentRequest(request);
     }
 
@@ -255,6 +345,10 @@ export const requestService = {
       const result = await requestRepository.updateStatusIfCurrently(id, 'PUBLISHED', {
         status: 'CREATOR_ASSIGNED',
         creatorId,
+        // Kept alongside `creatorId` (not a replacement) — see the schema comment on
+        // `lastAssignedCreatorId`: it survives the acceptance-timer sweep nulling `creatorId`,
+        // so trustScoreService can still compute this Creator's fulfilment history afterward.
+        lastAssignedCreatorId: creatorId,
         acceptedAt: now,
         acceptanceTimerExpiresAt: new Date(now.getTime() + ttlMs),
       });
@@ -272,11 +366,36 @@ export const requestService = {
       throw err;
     }
 
-    await fcmService.sendToUser(request.requesterId, {
-      title: 'Creator found!',
-      body: 'A Creator has accepted your request and is on the way.',
-      data: {type: 'REQUEST_ACCEPTED', requestId: id},
-    });
+    // Chat opens automatically the instant GPS-validated acceptance completes (PRD §5.4).
+    // The row is no longer PUBLISHED and is exclusively owned by this Creator at this point,
+    // so this is a plain transition, not a race-guarded conditional update.
+    assertTransition('CREATOR_ASSIGNED', 'TEMPORARY_CHAT');
+    updated = await requestRepository.update(id, {status: 'TEMPORARY_CHAT'});
+
+    await notificationService.notifyUser(
+      request.requesterId,
+      NotificationType.CREATOR_ACCEPTED,
+      'Creator found!',
+      'A Creator has accepted your request and is on the way.',
+      {requestId: id, screen: 'RequestDetail'},
+    );
+
+    // Chat opens automatically the instant acceptance completes (PRD §5.4) — notify both
+    // participants it's available now.
+    await notificationService.notifyUser(
+      request.requesterId,
+      NotificationType.CHAT_OPENED,
+      'Chat opened',
+      'You can now chat with your Creator until recording starts.',
+      {requestId: id, screen: 'Chat'},
+    );
+    await notificationService.notifyUser(
+      creatorId,
+      NotificationType.CHAT_OPENED,
+      'Chat opened',
+      'You can now chat with the Requester until you start recording.',
+      {requestId: id, screen: 'Chat'},
+    );
 
     return presentRequest(updated!);
   },
@@ -301,7 +420,9 @@ export const requestService = {
       limit,
     );
     return {
-      items: result.items.map(item => presentRequest(item, item.distanceMeters)),
+      items: await Promise.all(
+        result.items.map(item => attachRequesterTrustProfile(presentRequest(item, item.distanceMeters), item)),
+      ),
       total: result.total,
       page: result.page,
       limit: result.limit,
@@ -326,7 +447,12 @@ export const requestService = {
       skip,
       take: limit,
     });
-    return {items: items.map(item => presentRequest(item)), total, page, limit};
+    return {
+      items: await Promise.all(items.map(item => attachRequesterTrustProfile(presentRequest(item), item))),
+      total,
+      page,
+      limit,
+    };
   },
 
   /** `GET /requests/:id/details` — Creator-facing detail view, any authenticated user, non-DRAFT only. */
@@ -344,11 +470,13 @@ export const requestService = {
       ? haversineMeters(origin.latitude, origin.longitude, request.latitude, request.longitude)
       : undefined;
 
-    return {
+    const presented = {
       ...presentRequest(request, distanceMeters),
       isOwnRequest: request.requesterId === creatorId,
       isLocked: request.status !== 'PUBLISHED' && request.status !== 'DRAFT',
       isVisible: creatorMatchingService.isVisibleToCreator(request, creatorId),
     };
+    const withRatings = await ratingService.attachRatingSummaries(presented, request);
+    return trustScoreService.attachTrustSummaries(withRatings, request);
   },
 };

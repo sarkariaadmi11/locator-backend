@@ -3,6 +3,8 @@ import {Request, Response} from 'express';
 import {logger} from '../config/logger';
 import {AuthenticatedRequest} from '../middlewares/authMiddleware';
 import {authService} from '../services/authService';
+import {ratingService} from '../services/ratingService';
+import {trustScoreService} from '../services/trustScoreService';
 import {sendSuccess} from '../utils/apiResponse';
 import {presentUser} from '../utils/userPresenter';
 
@@ -27,7 +29,17 @@ export const authController = {
   },
 
   async me(req: AuthenticatedRequest, res: Response) {
-    sendSuccess(res, 200, 'Authenticated user fetched.', presentUser(req.user!));
+    const [ratingSummary, requesterTrustProfile, creatorTrustProfile] = await Promise.all([
+      ratingService.getSummaryForUser(req.user!.id),
+      trustScoreService.getProfile(req.user!.id, 'requester'),
+      trustScoreService.getProfile(req.user!.id, 'creator'),
+    ]);
+    sendSuccess(res, 200, 'Authenticated user fetched.', {
+      ...presentUser(req.user!),
+      ...ratingSummary,
+      requesterTrustProfile,
+      creatorTrustProfile,
+    });
   },
 
   async requestPasswordReset(req: Request, res: Response) {

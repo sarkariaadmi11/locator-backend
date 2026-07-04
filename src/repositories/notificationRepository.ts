@@ -24,6 +24,10 @@ export const notificationRepository = {
     return prisma.notification.count({where: {userId}});
   },
 
+  countUnreadForUser(userId: string) {
+    return prisma.notification.count({where: {userId, isRead: false}});
+  },
+
   markRead(id: string) {
     return prisma.notification.update({where: {id}, data: {isRead: true}});
   },
@@ -33,5 +37,10 @@ export const notificationRepository = {
       where: {userId, isRead: false},
       data: {isRead: true},
     });
+  },
+
+  /** Notification retention purge (backend Phase 13) — only read notifications are ever purged. */
+  deleteReadOlderThan(cutoff: Date) {
+    return prisma.notification.deleteMany({where: {isRead: true, createdAt: {lte: cutoff}}});
   },
 };

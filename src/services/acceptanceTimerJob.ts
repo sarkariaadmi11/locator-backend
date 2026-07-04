@@ -1,16 +1,18 @@
 import {logger} from '../config/logger';
 import {requestRepository} from '../repositories/requestRepository';
 import {creatorLockKey, creatorLockService} from './creatorLockService';
-import {fcmService} from './fcmService';
+import {notificationService} from './notificationService';
+import {NotificationType} from './notificationTypes';
 import {assertTransition} from './requestStateMachine';
 
 /**
  * Acceptance-timer expiry sweep (PRD §5.5). A Creator has `ACCEPTANCE_TIMER_MINUTES` from
- * acceptance to start recording; if that window lapses with no progress (state is still
- * `CREATOR_ASSIGNED`, never advanced to `TEMPORARY_CHAT`/`RECORDING`), the Redis lock has
- * already expired on its own TTL — this job is what actually unwinds the Postgres side:
- * release the lock (idempotent no-op if Redis already evicted it), republish the request
- * (`CREATOR_ASSIGNED` -> `PUBLISHED`), and notify the Requester.
+ * acceptance to start recording; chat opens automatically right after acceptance (state ->
+ * `TEMPORARY_CHAT`, PRD §5.4), so that's the state this window is actually observed in. If
+ * the window lapses with no progress (state is still `TEMPORARY_CHAT`, never advanced to
+ * `RECORDING`), the Redis lock has already expired on its own TTL — this job is what actually
+ * unwinds the Postgres side: release the lock (idempotent no-op if Redis already evicted it),
+ * republish the request (`TEMPORARY_CHAT` -> `PUBLISHED`), and notify the Requester.
  */
 export const acceptanceTimerJob = {
   async runSweep() {
@@ -18,13 +20,17 @@ export const acceptanceTimerJob = {
     let released = 0;
 
     for (const request of candidates) {
-      if (!assertTransitionSafe('CREATOR_ASSIGNED', 'PUBLISHED')) continue;
+      if (!assertTransitionSafe('TEMPORARY_CHAT', 'PUBLISHED')) continue;
 
-      const result = await requestRepository.updateStatusIfCurrently(request.id, 'CREATOR_ASSIGNED', {
+      const result = await requestRepository.updateStatusIfCurrently(request.id, 'TEMPORARY_CHAT', {
         status: 'PUBLISHED',
         creatorId: null,
         acceptedAt: null,
         acceptanceTimerExpiresAt: null,
+        // `lastAssignedCreatorId` is deliberately NOT cleared here (Trust Profile, backend
+        // Phase 10) — it's the only remaining record of who abandoned this request, paired
+        // with `creatorTimedOut` below.
+        creatorTimedOut: true,
       });
 
       if (result.count === 0) continue;
@@ -34,11 +40,13 @@ export const acceptanceTimerJob = {
       // has independently confirmed via the DB row that the lock must not survive regardless.
       await creatorLockService.forceRelease(creatorLockKey(request.id));
 
-      await fcmService.sendToUser(request.requesterId, {
-        title: 'Still searching for a Creator',
-        body: 'Your creator was unable to start in time — we\'re re-broadcasting your request to nearby creators.',
-        data: {type: 'ACCEPTANCE_EXPIRED', requestId: request.id},
-      });
+      await notificationService.notifyUser(
+        request.requesterId,
+        NotificationType.CREATOR_TIMED_OUT,
+        'Still searching for a Creator',
+        "Your creator was unable to start in time — we're re-broadcasting your request to nearby creators.",
+        {requestId: request.id, screen: 'RequestDetail'},
+      );
 
       released += 1;
     }

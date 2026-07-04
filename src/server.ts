@@ -9,12 +9,18 @@ import {logger} from './config/logger';
 import {disconnectRedis} from './config/redis';
 import {prisma} from './prisma/client';
 import {acceptanceTimerJob} from './services/acceptanceTimerJob';
+import {monitoringJob} from './services/monitoringJob';
+import {notificationReminderJob} from './services/notificationReminderJob';
 import {requestLifecycleJob} from './services/requestLifecycleJob';
+import {retentionJob} from './services/retentionJob';
 import {seedAdmins} from './utils/seedAdmins';
 import {runStartupChecks, logStartupSummary} from './utils/startupChecks';
 
 const REQUEST_LIFECYCLE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 const ACCEPTANCE_TIMER_SWEEP_INTERVAL_MS = 30 * 1000;
+const NOTIFICATION_REMINDER_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+const RETENTION_SWEEP_INTERVAL_MS = env.RETENTION_SWEEP_INTERVAL_MINUTES * 60 * 1000;
+const MONITORING_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
 async function bootstrap() {
   const checks = await runStartupChecks();
@@ -48,10 +54,39 @@ async function bootstrap() {
     });
   }, ACCEPTANCE_TIMER_SWEEP_INTERVAL_MS);
 
+  // Reminder sweep (backend Phase 12) — recording/review/rating reminders, each gated on its
+  // own `*ReminderSentAt` timestamp so a request is only ever reminded once per stage.
+  const notificationReminderInterval = setInterval(() => {
+    notificationReminderJob.runSweep().catch(err => {
+      logger.error(`[notificationReminderJob] Sweep failed: ${(err as Error).message}`);
+    });
+  }, NOTIFICATION_REMINDER_SWEEP_INTERVAL_MS);
+
+  // Compliance & Data Retention sweep (backend Phase 13) — chat/video/notification purges,
+  // inactive-account cleanup, expired-draft cleanup, and scheduled hard-deletes. Runs far less
+  // often than the other jobs since these windows are days/hours, not minutes.
+  const retentionInterval = setInterval(() => {
+    retentionJob.runSweep().catch(err => {
+      logger.error(`[retentionJob] Sweep failed: ${(err as Error).message}`);
+    });
+  }, RETENTION_SWEEP_INTERVAL_MS);
+
+  // Monitoring/alerting sweep (PRD §11, backend Phase 14) — moderation/payout queue depth and
+  // failed-webhook rate, each checked against a documented threshold and pushed to Admins as a
+  // notification when breached (see monitoringJob.ts).
+  const monitoringInterval = setInterval(() => {
+    monitoringJob.runSweep().catch(err => {
+      logger.error(`[monitoringJob] Sweep failed: ${(err as Error).message}`);
+    });
+  }, MONITORING_SWEEP_INTERVAL_MS);
+
   const shutdown = async (signal: string) => {
     logger.info(`${signal} received. Shutting down gracefully.`);
     clearInterval(lifecycleInterval);
     clearInterval(acceptanceTimerInterval);
+    clearInterval(notificationReminderInterval);
+    clearInterval(retentionInterval);
+    clearInterval(monitoringInterval);
     server.close(async () => {
       await prisma.$disconnect();
       await disconnectRedis();

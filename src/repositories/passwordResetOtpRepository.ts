@@ -26,4 +26,9 @@ export const passwordResetOtpRepository = {
   delete(id: string) {
     return prisma.passwordResetOtp.delete({where: {id}});
   },
+
+  /** Inactive-account cleanup sweep (backend Phase 13) — expired rows are pure clutter. */
+  deleteExpired(now: Date) {
+    return prisma.passwordResetOtp.deleteMany({where: {expiresAt: {lte: now}}});
+  },
 };

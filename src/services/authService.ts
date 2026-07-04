@@ -6,6 +6,8 @@ import {passwordResetOtpRepository} from '../repositories/passwordResetOtpReposi
 import {registrationOtpRepository} from '../repositories/registrationOtpRepository';
 import {userRepository} from '../repositories/userRepository';
 import {mailService} from './mailService';
+import {notificationService} from './notificationService';
+import {NotificationType} from './notificationTypes';
 import {HttpError} from '../utils/httpError';
 import {signResetToken, signToken, verifyResetToken} from '../utils/jwt';
 import {presentUser} from '../utils/userPresenter';
@@ -121,6 +123,24 @@ export const authService = {
     });
     await registrationOtpRepository.delete(pendingRegistration.id);
 
+    // Signup-completion + welcome notifications (backend Phase 12, PRD §8.1 "Authentication").
+    // Both fire together at account-creation time — there's no separate "first login" event to
+    // distinguish them from in this codebase, so this is the interim decision (flagged, not a
+    // PRD-specified distinct trigger).
+    await notificationService.notifyUser(
+      user.id,
+      NotificationType.SIGNUP_SUCCESSFUL,
+      'Signup successful',
+      'Your Locator account has been created.',
+    );
+    await notificationService.notifyUser(
+      user.id,
+      NotificationType.WELCOME,
+      `Welcome to Locator, ${user.name}!`,
+      'Browse nearby requests as a Creator, or post your first paid video request as a Requester.',
+    );
+    mailService.sendWelcomeEmail(user.email, user.name).catch(() => {});
+
     return {
       user: presentUser(user),
       token: signToken(user.id),
@@ -210,5 +230,13 @@ export const authService = {
     const passwordHash = await bcrypt.hash(input.password, 12);
     await userRepository.updatePassword(user.id, passwordHash);
     logger.info(`Password reset for user ${user.id}`);
+
+    await notificationService.notifyUser(
+      user.id,
+      NotificationType.PASSWORD_RESET_CONFIRMATION,
+      'Password reset confirmation',
+      'Your Locator password was changed successfully.',
+    );
+    mailService.sendPasswordResetConfirmation(user.email).catch(() => {});
   },
 };

@@ -39,7 +39,7 @@ export const requestRepository = {
         status: {in: ['DRAFT', 'PUBLISHED']},
         expiresAt: {lte: now},
       },
-      select: {id: true, status: true},
+      select: {id: true, status: true, requesterId: true},
     });
   },
 
@@ -54,6 +54,21 @@ export const requestRepository = {
         highValueReviewRequired: false,
       },
       select: {id: true},
+    });
+  },
+
+  /**
+   * Account Deletion workflow (backend Phase 13) — blocks a delete request while the user has
+   * any Request mid-flow (either side) so a deletion can never orphan a live escrow/chat/video
+   * pipeline. `terminalStatuses` is passed in by the caller (requestStateMachine's own list) so
+   * this repository doesn't need to duplicate/import that business rule.
+   */
+  countActiveForUser(userId: string, terminalStatuses: RequestStatus[]) {
+    return prisma.request.count({
+      where: {
+        OR: [{requesterId: userId}, {creatorId: userId}],
+        status: {notIn: terminalStatuses},
+      },
     });
   },
 
@@ -153,11 +168,16 @@ export const requestRepository = {
     });
   },
 
-  /** Used by the acceptance-timer sweep — requests whose Creator never started recording in time. */
+  /**
+   * Used by the acceptance-timer sweep — requests whose Creator never started recording in
+   * time. Acceptance immediately advances a request past `CREATOR_ASSIGNED` into
+   * `TEMPORARY_CHAT` (chat opens automatically, PRD §5.4), so that's the status this window
+   * is actually observed in, not `CREATOR_ASSIGNED` itself (which is transient).
+   */
   findAcceptanceTimerExpired(now: Date) {
     return prisma.request.findMany({
       where: {
-        status: 'CREATOR_ASSIGNED',
+        status: 'TEMPORARY_CHAT',
         acceptanceTimerExpiresAt: {lte: now},
       },
       select: {id: true, creatorId: true, requesterId: true},
@@ -195,5 +215,99 @@ export const requestRepository = {
       orderBy: {acceptedAt: 'desc'},
       take,
     });
+  },
+
+  // --- Notification reminder sweep candidates (backend Phase 12, notificationReminderJob) -----
+
+  /** Still RECORDING and not yet reminded, past the recording-reminder threshold. */
+  findRecordingReminderCandidates(olderThan: Date) {
+    return prisma.request.findMany({
+      where: {
+        status: 'RECORDING',
+        recordingStartedAt: {lte: olderThan},
+        recordingReminderSentAt: null,
+      },
+      select: {id: true, creatorId: true},
+    });
+  },
+
+  /** Still REQUESTER_REVIEW and not yet reminded, past the review-reminder threshold. */
+  findReviewReminderCandidates(olderThan: Date) {
+    return prisma.request.findMany({
+      where: {
+        status: 'REQUESTER_REVIEW',
+        moderatorDecisionAt: {lte: olderThan},
+        reviewReminderSentAt: null,
+      },
+      select: {id: true, requesterId: true},
+    });
+  },
+
+  /** COMPLETED, not yet reminded, past the rating-reminder threshold — filtered for missing ratings in the service layer. */
+  findRatingReminderCandidates(olderThan: Date) {
+    return prisma.request.findMany({
+      where: {
+        status: 'COMPLETED',
+        requesterDecisionAt: {lte: olderThan},
+        ratingReminderSentAt: null,
+      },
+      select: {id: true, requesterId: true, creatorId: true},
+    });
+  },
+
+  // --- Admin: Live Monitoring / Active Request Dashboard (PRD §5.14.2/§5.14.3, backend Phase 11) --
+
+  /**
+   * Per-status counts across every currently-non-terminal Request — the Live Monitoring
+   * Dashboard's per-stage tile row. `terminalStatuses` is passed in by the caller
+   * (`requestStateMachine.TERMINAL_STATUSES`) so this repository doesn't duplicate that
+   * business rule, matching the existing `countActiveForUser` convention above.
+   */
+  async countGroupedByLiveStatus(terminalStatuses: RequestStatus[]) {
+    const rows = await prisma.request.groupBy({
+      by: ['status'],
+      _count: {_all: true},
+      where: {status: {notIn: terminalStatuses}},
+    });
+    return rows.map(row => ({status: row.status, count: row._count._all}));
+  },
+
+  /** Total non-terminal ("live") Request count — the Live Monitoring Dashboard's headline tile. */
+  countActiveTotal(terminalStatuses: RequestStatus[]) {
+    return prisma.request.count({where: {status: {notIn: terminalStatuses}}});
+  },
+
+  /** Requests created since `since` (for "Total Requests Today", PRD §5.14.1). */
+  countCreatedSince(since: Date) {
+    return prisma.request.count({where: {createdAt: {gte: since}}});
+  },
+
+  /**
+   * Active Request Dashboard (PRD §5.14.3) — every currently in-flight Request (non-terminal,
+   * or a specific status the Admin filtered to), newest-first, with just enough
+   * requester/creator identity for the admin list view (no full profile join).
+   */
+  findManyActiveForAdmin(params: {
+    status?: RequestStatus;
+    terminalStatuses: RequestStatus[];
+    skip: number;
+    take: number;
+  }) {
+    const where: Prisma.RequestWhereInput = {
+      status: params.status ?? {notIn: params.terminalStatuses},
+    };
+    return Promise.all([
+      prisma.request.findMany({
+        where,
+        orderBy: {createdAt: 'desc'},
+        skip: params.skip,
+        take: params.take,
+        include: {
+          requester: {select: {id: true, name: true, username: true}},
+          creator: {select: {id: true, name: true, username: true}},
+        },
+      }),
+      prisma.request.count({where}),
+    ]);
   },
 };

@@ -6,6 +6,8 @@ import {boundingBox, haversineMeters} from '../utils/geo';
 import {HttpError} from '../utils/httpError';
 import {presentRequest} from '../utils/requestPresenter';
 import {presentUser} from '../utils/userPresenter';
+import {ratingService} from './ratingService';
+import {trustScoreService} from './trustScoreService';
 import {REQUEST_DEFAULT_RADIUS_METERS} from '../validations/requestValidation';
 
 const DASHBOARD_PENDING_PREVIEW_LIMIT = 5;
@@ -60,13 +62,17 @@ export const creatorService = {
         .map(({request, distanceMeters}) => presentRequest(request, distanceMeters));
     }
 
-    const [activeRequest, acceptedRequests] = await Promise.all([
+    const [activeRequest, acceptedRequests, myRating, myTrustProfile] = await Promise.all([
       requestRepository.findActiveForCreator(userId),
       requestRepository.findAcceptedForCreator(userId, DASHBOARD_ACCEPTED_PREVIEW_LIMIT),
+      ratingService.getSummaryForUser(userId),
+      trustScoreService.getProfile(userId, 'creator'),
     ]);
 
     return {
       availabilityStatus: user.availabilityStatus,
+      myRating,
+      myTrustProfile,
       location:
         user.latitude !== null && user.longitude !== null
           ? {latitude: user.latitude, longitude: user.longitude, updatedAt: user.locationUpdatedAt?.toISOString() ?? null}
@@ -74,8 +80,10 @@ export const creatorService = {
       nearbyRequestsCount,
       pendingRequests: pendingRequestsPreview,
       activeRequest: activeRequest ? presentRequest(activeRequest) : null,
+      // Acceptance immediately advances a request into TEMPORARY_CHAT (chat opens
+      // automatically, PRD §5.4), so that's the status this countdown is observed in.
       acceptanceCountdownSeconds:
-        activeRequest?.acceptanceTimerExpiresAt && activeRequest.status === 'CREATOR_ASSIGNED'
+        activeRequest?.acceptanceTimerExpiresAt && activeRequest.status === 'TEMPORARY_CHAT'
           ? Math.max(0, Math.round((activeRequest.acceptanceTimerExpiresAt.getTime() - Date.now()) / 1000))
           : null,
       acceptedRequests: acceptedRequests.map(request => presentRequest(request)),

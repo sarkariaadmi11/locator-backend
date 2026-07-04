@@ -32,6 +32,33 @@ const envSchema = z.object({
   // PRD §5.5 [REVIEW — suggested 15 min]. Configurable rather than hardcoded per
   // docs/CLAUDE.md §4/§11 "do not silently invent values for anything tagged [REVIEW]".
   ACCEPTANCE_TIMER_MINUTES: z.coerce.number().int().positive().default(15),
+  // Compliance & Data Retention (PRD §9, backend Phase 13) — how often the retention sweep runs.
+  // The retention *windows* themselves (chat/video/notification days, deletion grace period,
+  // consent versions) are DB-configurable via `ComplianceConfig`, not env vars — see
+  // `complianceConfigService` — so an Admin can adjust them without a redeploy.
+  RETENTION_SWEEP_INTERVAL_MINUTES: z.coerce.number().int().positive().default(60),
 });
 
-export const env = envSchema.parse(process.env);
+// Production Configuration hardening (backend Phase 14): a handful of vars are optional in
+// dev/test (silently degrading to a documented fallback — console-logged OTPs, disabled webhook
+// reconciliation, disabled push) but must be explicitly set before this app is trusted with real
+// traffic/money. Fails fast at boot rather than silently running production in a degraded mode.
+const baseEnv = envSchema.parse(process.env);
+
+if (baseEnv.NODE_ENV === 'production') {
+  const missing: string[] = [];
+  if (!baseEnv.BREVO_API_KEY || !baseEnv.BREVO_SENDER_EMAIL) missing.push('BREVO_API_KEY/BREVO_SENDER_EMAIL');
+  if (!baseEnv.RAZORPAY_WEBHOOK_SECRET) missing.push('RAZORPAY_WEBHOOK_SECRET');
+  if (!baseEnv.FIREBASE_SERVICE_ACCOUNT_PATH) missing.push('FIREBASE_SERVICE_ACCOUNT_PATH');
+  if (baseEnv.CORS_ORIGIN === '*') missing.push('CORS_ORIGIN (must not be "*" in production)');
+  if (baseEnv.ADMIN_PASSWORD === 'change-me-please') missing.push('ADMIN_PASSWORD (still the .env.example default)');
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Refusing to start in production with missing/unsafe configuration: ${missing.join(', ')}. ` +
+        'These are optional in development (documented fallbacks apply) but required once NODE_ENV=production.',
+    );
+  }
+}
+
+export const env = baseEnv;

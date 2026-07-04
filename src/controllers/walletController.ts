@@ -6,6 +6,7 @@ import {env} from '../config/env';
 import {logger} from '../config/logger';
 import {AuthenticatedRequest} from '../middlewares/authMiddleware';
 import {walletService} from '../services/walletService';
+import {recordWebhookFailure} from '../services/webhookHealthTracker';
 import {sendSuccess} from '../utils/apiResponse';
 import {HttpError} from '../utils/httpError';
 
@@ -57,12 +58,14 @@ export const walletController = {
   async webhook(req: Request & {rawBody?: Buffer}, res: Response) {
     if (!env.RAZORPAY_WEBHOOK_SECRET) {
       logger.warn('[walletController.webhook] RAZORPAY_WEBHOOK_SECRET not set — webhook disabled.');
+      recordWebhookFailure();
       throw new HttpError(503, 'Webhook not configured.');
     }
 
     const signature = req.header('x-razorpay-signature');
     if (!verifyWebhookSignature(req.rawBody, signature)) {
       logger.warn('[walletController.webhook] Rejected webhook — invalid or missing signature.');
+      recordWebhookFailure();
       throw new HttpError(400, 'Invalid webhook signature.');
     }
 
@@ -72,10 +75,17 @@ export const walletController = {
     };
 
     if (!event) {
+      recordWebhookFailure();
       throw new HttpError(400, 'Missing event type.');
     }
 
-    const result = await walletService.handleWebhookEvent(event, payload ?? {});
+    let result;
+    try {
+      result = await walletService.handleWebhookEvent(event, payload ?? {});
+    } catch (err) {
+      recordWebhookFailure();
+      throw err;
+    }
     logger.info(`[walletController.webhook] event="${event}" result=${JSON.stringify(result)}`);
     sendSuccess(res, 200, 'Webhook processed.', null);
   },

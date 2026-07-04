@@ -38,6 +38,52 @@ export const userRepository = {
     return prisma.user.update({where: {id}, data: {availabilityStatus}});
   },
 
+  /** Inactive-account cleanup sweep (backend Phase 13) — stale FCM tokens are dead weight. */
+  findInactiveWithFcmToken(cutoff: Date) {
+    return prisma.user.findMany({
+      where: {updatedAt: {lte: cutoff}, fcmToken: {not: null}},
+      select: {id: true},
+    });
+  },
+
+  clearFcmToken(id: string) {
+    return prisma.user.update({where: {id}, data: {fcmToken: null}});
+  },
+
+  /** Account Deletion hard-delete scheduler (backend Phase 13). */
+  findScheduledForHardDelete(now: Date) {
+    return prisma.user.findMany({
+      where: {deletionScheduledFor: {lte: now}},
+      select: {id: true, email: true, username: true},
+    });
+  },
+
+  /**
+   * Irreversible PII anonymization (not a literal row delete — see `accountDeletionService`'s
+   * file-level comment for why). `email`/`username` are still `@unique`, so they're replaced
+   * with a value derived from the row's own id, which can never collide with a real user's.
+   */
+  anonymize(id: string) {
+    return prisma.user.update({
+      where: {id},
+      data: {
+        name: 'Deleted User',
+        username: `deleted-${id}`,
+        email: `deleted-${id}@deleted.locator`,
+        password: '',
+        profileImage: null,
+        bio: null,
+        city: null,
+        latitude: null,
+        longitude: null,
+        fcmToken: null,
+        isActive: false,
+        deletionRequestedAt: null,
+        deletionScheduledFor: null,
+      },
+    });
+  },
+
   /**
    * Coarse bounding-box prefilter of ONLINE creators around a point — exact haversine
    * distance/radius filtering happens in the service layer (see `utils/geo.ts`). Excludes

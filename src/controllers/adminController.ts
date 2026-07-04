@@ -1,3 +1,4 @@
+import {RequestStatus} from '@prisma/client';
 import {Request, Response} from 'express';
 import {z} from 'zod';
 
@@ -25,6 +26,21 @@ export const adminController = {
     sendSuccess(res, 200, 'Dashboard KPIs fetched.', data);
   },
 
+  async getLiveMonitoring(_req: Request, res: Response) {
+    const data = await adminService.getLiveMonitoring();
+    sendSuccess(res, 200, 'Live monitoring snapshot fetched.', data);
+  },
+
+  async getActiveRequests(req: Request, res: Response) {
+    const {page, limit, status} = req.query as unknown as {
+      page: number;
+      limit: number;
+      status?: RequestStatus;
+    };
+    const data = await adminService.getActiveRequests(status, page, limit);
+    sendSuccess(res, 200, 'Active requests fetched.', data);
+  },
+
   async listUsers(req: Request, res: Response) {
     const page = Number(req.query.page) || 1;
     const limit = Number(req.query.limit) || 20;
@@ -34,13 +50,13 @@ export const adminController = {
     sendSuccess(res, 200, 'Users fetched.', data);
   },
 
-  async toggleBlock(req: Request, res: Response) {
-    const data = await adminService.toggleBlock(req.params.id as string);
+  async toggleBlock(req: AdminRequest, res: Response) {
+    const data = await adminService.toggleBlock(req.admin!.id, req.params.id as string);
     sendSuccess(res, 200, 'User block status updated.', data);
   },
 
-  async toggleSuspicious(req: Request, res: Response) {
-    const data = await adminService.toggleSuspicious(req.params.id as string);
+  async toggleSuspicious(req: AdminRequest, res: Response) {
+    const data = await adminService.toggleSuspicious(req.admin!.id, req.params.id as string);
     sendSuccess(res, 200, 'User suspicious status updated.', data);
   },
 
@@ -69,9 +85,9 @@ export const adminController = {
     sendSuccess(res, 200, 'Payout requests fetched.', data);
   },
 
-  async processPayout(req: Request, res: Response) {
+  async processPayout(req: AdminRequest, res: Response) {
     const {action, adminNote} = req.body;
-    const data = await adminService.processPayout(req.params.id as string, action, adminNote);
+    const data = await adminService.processPayout(req.admin!.id, req.params.id as string, action, adminNote);
     sendSuccess(res, 200, `Payout ${action}d.`, data);
   },
 

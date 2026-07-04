@@ -1,14 +1,48 @@
-import {Prisma} from '@prisma/client';
+import {Prisma, RequestStatus} from '@prisma/client';
 
 import {prisma} from '../prisma/client';
 import {payoutRequestRepository} from '../repositories/payoutRequestRepository';
+import {requestRepository} from '../repositories/requestRepository';
 import {transactionRepository} from '../repositories/transactionRepository';
-import {fcmService} from './fcmService';
+import {adminAuditLogService} from './adminAuditLogService';
+import {disputeService} from './disputeService';
+import {moderationService} from './moderationService';
+import {notificationService} from './notificationService';
+import {NotificationType} from './notificationTypes';
+import {TERMINAL_STATUSES} from './requestStateMachine';
 import {HttpError} from '../utils/httpError';
+import {presentRequest} from '../utils/requestPresenter';
 import {presentUser} from '../utils/userPresenter';
 
+// "Live" statuses for the Live Monitoring Dashboard tile row (PRD §5.14.2) — every non-terminal
+// PRD §5.13 state, in lifecycle order, so the dashboard always renders a stable, complete row
+// even for statuses currently at 0 (no in-flight request happens to be in that stage right now).
+const LIVE_STATUS_ORDER: RequestStatus[] = [
+  'DRAFT',
+  'PUBLISHED',
+  'CREATOR_ASSIGNED',
+  'TEMPORARY_CHAT',
+  'RECORDING',
+  'UPLOAD',
+  'MODERATOR_REVIEW',
+  'REQUESTER_REVIEW',
+  'RESHOOT_REQUESTED',
+  'ACCEPTED',
+  'PAYMENT_RELEASED',
+];
+
 export const adminService = {
+  /**
+   * Dashboard KPI tiles (PRD §5.14.1). Extended (backend Phase 11) beyond the pre-PRD generic
+   * user/revenue counts with the PRD's own named tiles — Total Requests Today, Active Requests,
+   * Moderation Queue depth, Pending Disputes — sourced from the same services/repositories their
+   * own dedicated dashboards use (`moderationService.getStats`, `disputeService.adminStats`,
+   * `requestRepository`), not a second parallel query path.
+   */
   async getDashboardKpis() {
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
     const [
       totalUsers,
       activeUsers,
@@ -18,6 +52,11 @@ export const adminService = {
       totalRevenue,
       pendingPayouts,
       pendingPayoutAmount,
+      totalRequestsToday,
+      activeRequests,
+      moderationStats,
+      disputeStats,
+      onlineCreators,
     ] = await Promise.all([
       prisma.user.count(),
       prisma.user.count({where: {isActive: true}}),
@@ -27,6 +66,11 @@ export const adminService = {
       transactionRepository.aggregateSum({status: 'SUCCESS', type: 'CREDIT'}),
       payoutRequestRepository.count({status: 'PENDING'}),
       payoutRequestRepository.aggregateSum({status: 'PENDING'}),
+      requestRepository.countCreatedSince(startOfToday),
+      requestRepository.countActiveTotal(TERMINAL_STATUSES as RequestStatus[]),
+      moderationService.getStats(),
+      disputeService.adminStats(),
+      prisma.user.count({where: {availabilityStatus: 'ONLINE'}}),
     ]);
 
     return {
@@ -38,6 +82,75 @@ export const adminService = {
       totalRevenue: Number(totalRevenue._sum.amount ?? 0),
       pendingPayouts,
       pendingPayoutAmount: Number(pendingPayoutAmount._sum.amount ?? 0),
+      totalRequestsToday,
+      activeRequests,
+      moderationQueueDepth: moderationStats.pendingQueueDepth,
+      pendingDisputes: disputeStats.open + disputeStats.underReview,
+      onlineCreators,
+    };
+  },
+
+  /**
+   * Live Monitoring Dashboard (PRD §5.14.2) — a real-time snapshot of every in-flight Request
+   * grouped by lifecycle stage, plus the operational signals an Admin watches minute-to-minute
+   * (online Creator supply, moderation backlog, open disputes, flagged chats). Composed from the
+   * same per-domain services/repositories their own dedicated screens already use — no second
+   * parallel aggregation logic.
+   */
+  async getLiveMonitoring() {
+    const [grouped, onlineCreators, moderationStats, disputeStats, flaggedChats] = await Promise.all([
+      requestRepository.countGroupedByLiveStatus(TERMINAL_STATUSES as RequestStatus[]),
+      prisma.user.count({where: {availabilityStatus: 'ONLINE'}}),
+      moderationService.getStats(),
+      disputeService.adminStats(),
+      prisma.request.count({
+        where: {chatFlaggedForReview: true, status: {notIn: TERMINAL_STATUSES as RequestStatus[]}},
+      }),
+    ]);
+
+    const countByStatus = new Map(grouped.map(row => [row.status, row.count]));
+    const requestsByStatus = LIVE_STATUS_ORDER.map(status => ({
+      status,
+      count: countByStatus.get(status) ?? 0,
+    }));
+
+    return {
+      totalActiveRequests: requestsByStatus.reduce((sum, row) => sum + row.count, 0),
+      requestsByStatus,
+      onlineCreators,
+      moderationQueueDepth: moderationStats.pendingQueueDepth,
+      openDisputes: disputeStats.open,
+      underReviewDisputes: disputeStats.underReview,
+      flaggedChats,
+      generatedAt: new Date().toISOString(),
+    };
+  },
+
+  /**
+   * Active Request Dashboard (PRD §5.14.3) — paginated list of every currently in-flight
+   * Request (or a single status the Admin filtered to), with just enough participant identity
+   * for the admin list view. Reuses the existing participant-facing `presentRequest` shape so
+   * the Admin sees the exact same field names as every other Request payload in this codebase.
+   */
+  async getActiveRequests(status: RequestStatus | undefined, page: number, limit: number) {
+    const skip = (page - 1) * limit;
+    const [items, total] = await requestRepository.findManyActiveForAdmin({
+      status,
+      terminalStatuses: TERMINAL_STATUSES as RequestStatus[],
+      skip,
+      take: limit,
+    });
+
+    return {
+      items: items.map(item => ({
+        ...presentRequest(item),
+        requester: item.requester,
+        creator: item.creator,
+      })),
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
     };
   },
 
@@ -87,7 +200,15 @@ export const adminService = {
     };
   },
 
-  async toggleBlock(userId: string) {
+  /**
+   * Audit Logs backfill (PRD §5.14.7, backend Phase 11) — `AdminAuditLog` previously only
+   * recorded Moderation/Escrow/Dispute/Compliance actions (each added alongside its own
+   * feature). User block/suspicious toggles predate `AdminAuditLog`'s existence (backend Phase
+   * 6) and were never wired to it. There is no way to retroactively create audit rows for past
+   * toggles that were never logged — this closes the gap going forward, the same "backfill"
+   * scope every other pre-existing-action audit gap in this codebase has meant.
+   */
+  async toggleBlock(adminId: string, userId: string) {
     const user = await prisma.user.findUnique({where: {id: userId}});
     if (!user) throw new HttpError(404, 'User not found.');
 
@@ -95,10 +216,22 @@ export const adminService = {
       where: {id: userId},
       data: {isActive: !user.isActive},
     });
+
+    await adminAuditLogService.log(adminId, updated.isActive ? 'USER_UNBLOCKED' : 'USER_BLOCKED', 'User', userId);
+
+    if (!updated.isActive) {
+      await notificationService.notifyUser(
+        userId,
+        NotificationType.ACCOUNT_SUSPENDED,
+        'Account Suspended',
+        'Your account has been suspended by an Admin. Contact support for details.',
+      );
+    }
+
     return presentUser(updated);
   },
 
-  async toggleSuspicious(userId: string) {
+  async toggleSuspicious(adminId: string, userId: string) {
     const user = await prisma.user.findUnique({where: {id: userId}});
     if (!user) throw new HttpError(404, 'User not found.');
 
@@ -106,6 +239,14 @@ export const adminService = {
       where: {id: userId},
       data: {isSuspicious: !user.isSuspicious},
     });
+
+    await adminAuditLogService.log(
+      adminId,
+      updated.isSuspicious ? 'USER_FLAGGED_SUSPICIOUS' : 'USER_UNFLAGGED_SUSPICIOUS',
+      'User',
+      userId,
+    );
+
     return presentUser(updated);
   },
 
@@ -196,7 +337,7 @@ export const adminService = {
     };
   },
 
-  async processPayout(payoutId: string, action: 'approve' | 'reject', adminNote?: string) {
+  async processPayout(adminId: string, payoutId: string, action: 'approve' | 'reject', adminNote?: string) {
     const payout = await payoutRequestRepository.findById(payoutId);
 
     if (!payout) throw new HttpError(404, 'Payout request not found.');
@@ -229,22 +370,34 @@ export const adminService = {
         }),
       ]);
 
-      await fcmService.sendToUser(payout.userId, {
-        title: 'Withdrawal Approved ✓',
-        body: `Your withdrawal of ₹${amount} has been approved and deducted from your wallet.`,
-        data: {type: 'PAYOUT_APPROVED', payoutId, amount},
-      });
+      await notificationService.notifyUser(
+        payout.userId,
+        NotificationType.PAYOUT_APPROVED,
+        'Withdrawal Approved ✓',
+        `Your withdrawal of ₹${amount} has been approved and deducted from your wallet.`,
+        {payoutId, amount, screen: 'Wallet'},
+      );
     } else {
       await payoutRequestRepository.update(payoutId, {status: 'REJECTED', adminNote, processedAt: new Date()});
 
-      await fcmService.sendToUser(payout.userId, {
-        title: 'Withdrawal Rejected',
-        body: adminNote
+      await notificationService.notifyUser(
+        payout.userId,
+        NotificationType.PAYOUT_REJECTED,
+        'Withdrawal Rejected',
+        adminNote
           ? `Your withdrawal of ₹${amount} was rejected: ${adminNote}`
           : `Your withdrawal of ₹${amount} was rejected by admin.`,
-        data: {type: 'PAYOUT_REJECTED', payoutId, amount},
-      });
+        {payoutId, amount, screen: 'Wallet'},
+      );
     }
+
+    await adminAuditLogService.log(
+      adminId,
+      action === 'approve' ? 'PAYOUT_APPROVED' : 'PAYOUT_REJECTED',
+      'PayoutRequest',
+      payoutId,
+      {amount, adminNote: adminNote ?? null},
+    );
 
     return {id: payoutId, action};
   },

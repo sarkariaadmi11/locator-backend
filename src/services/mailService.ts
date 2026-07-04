@@ -131,6 +131,42 @@ const buildPasswordResetOtpHtml = (otp: string, expiresMinutes: number) => `
 </html>
 `;
 
+const buildSimpleNoticeHtml = (heading: string, message: string, accentFrom: string, accentTo: string) => `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Locator</title>
+</head>
+<body style="margin:0;padding:0;background-color:#f4f6f9;font-family:'Segoe UI',Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f6f9;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table width="560" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08);">
+          <tr>
+            <td style="background:linear-gradient(135deg,${accentFrom} 0%,${accentTo} 100%);padding:36px 40px;text-align:center;">
+              <p style="margin:0;font-size:28px;font-weight:900;letter-spacing:4px;color:#ffffff;">LOCATOR</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:40px 40px 32px;">
+              <p style="margin:0 0 8px;font-size:22px;font-weight:700;color:#1e1b4b;">${heading}</p>
+              <p style="margin:0 0 8px;font-size:15px;color:#6b7280;line-height:1.6;">${message}</p>
+              <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;" />
+              <p style="margin:0;font-size:13px;color:#9ca3af;line-height:1.6;">
+                This is an automated message from <strong>Locator</strong>. Please do not reply to this email.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+`;
+
 const CLIENT_SEND_FAILURE_MESSAGE =
   "We couldn't send the verification email right now due to an email provider issue. Please try again shortly.";
 
@@ -281,6 +317,69 @@ export const mailService = {
       }
       logger.error(`[mailService.sendPasswordResetOtp] Network error sending reset email to ${email}: ${(err as Error).message}`);
       throw new HttpError(500, CLIENT_SEND_FAILURE_MESSAGE);
+    }
+  },
+
+  /**
+   * Best-effort supplementary email (backend Phase 12) — unlike the two OTP senders above, a
+   * failure here must never block registration/login, so this never throws; it just logs.
+   */
+  async sendWelcomeEmail(email: string, name: string) {
+    if (!env.BREVO_API_KEY || !env.BREVO_SENDER_EMAIL) {
+      logger.info(`[DEV] Welcome email for ${email} (${name}) skipped — Brevo not configured.`);
+      return;
+    }
+    const payload = {
+      sender: {name: 'Locator', email: env.BREVO_SENDER_EMAIL},
+      to: [{email}],
+      subject: 'Welcome to Locator!',
+      textContent: `Hi ${name}, welcome to Locator! Your account is ready — start browsing nearby requests or post your first one.`,
+      htmlContent: buildSimpleNoticeHtml(
+        `Welcome, ${name}!`,
+        'Your Locator account is ready. Browse nearby requests as a Creator, or post your first paid video request as a Requester — the same account can do both.',
+        '#6366f1',
+        '#8b5cf6',
+      ),
+    };
+    try {
+      const res = await fetch(BREVO_API_URL, {
+        method: 'POST',
+        headers: {'api-key': env.BREVO_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) logBrevoFailure('sendWelcomeEmail', res.status, await res.text());
+    } catch (err) {
+      logger.error(`[mailService.sendWelcomeEmail] Network error sending welcome email to ${email}: ${(err as Error).message}`);
+    }
+  },
+
+  /** Best-effort — a completed password reset must never fail because this confirmation email failed to send. */
+  async sendPasswordResetConfirmation(email: string) {
+    if (!env.BREVO_API_KEY || !env.BREVO_SENDER_EMAIL) {
+      logger.info(`[DEV] Password reset confirmation email for ${email} skipped — Brevo not configured.`);
+      return;
+    }
+    const payload = {
+      sender: {name: 'Locator', email: env.BREVO_SENDER_EMAIL},
+      to: [{email}],
+      subject: 'Your Locator password was changed',
+      textContent: 'Your Locator account password was just changed. If this was not you, contact support immediately.',
+      htmlContent: buildSimpleNoticeHtml(
+        'Password changed',
+        'Your Locator account password was just changed successfully. If you did not make this change, contact support immediately.',
+        '#f97316',
+        '#ea580c',
+      ),
+    };
+    try {
+      const res = await fetch(BREVO_API_URL, {
+        method: 'POST',
+        headers: {'api-key': env.BREVO_API_KEY, 'Content-Type': 'application/json', Accept: 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) logBrevoFailure('sendPasswordResetConfirmation', res.status, await res.text());
+    } catch (err) {
+      logger.error(`[mailService.sendPasswordResetConfirmation] Network error sending confirmation email to ${email}: ${(err as Error).message}`);
     }
   },
 };

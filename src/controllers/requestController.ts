@@ -2,6 +2,8 @@ import {Response} from 'express';
 import {RequestCategory, RequestStatus, RequestType} from '@prisma/client';
 
 import {AuthenticatedRequest} from '../middlewares/authMiddleware';
+import {chatService} from '../services/chatService';
+import {escrowService} from '../services/escrowService';
 import {requestService} from '../services/requestService';
 import {sendSuccess} from '../utils/apiResponse';
 
@@ -89,5 +91,24 @@ export const requestController = {
     const {latitude, longitude} = req.body as {latitude: number; longitude: number};
     const data = await requestService.accept(req.user!.id, req.params.id as string, {latitude, longitude});
     sendSuccess(res, 200, 'Request accepted.', data);
+  },
+
+  // --- Temporary Chat (PRD §5.4) ----------------------------------------------------------
+
+  async listChat(req: AuthenticatedRequest, res: Response) {
+    const data = await chatService.list(req.user!.id, req.params.id as string);
+    sendSuccess(res, 200, 'Chat messages fetched.', data);
+  },
+
+  async sendChat(req: AuthenticatedRequest, res: Response) {
+    const data = await chatService.send(req.user!.id, req.params.id as string, req.body.body);
+    sendSuccess(res, 201, 'Message sent.', data);
+  },
+
+  // --- Escrow & Payment Release (PRD §7.1, §7.2, backend Phase 8) ------------------------
+
+  async getEscrow(req: AuthenticatedRequest, res: Response) {
+    const data = await escrowService.getForParticipant(req.user!.id, req.params.id as string);
+    sendSuccess(res, 200, 'Escrow fetched.', data);
   },
 };
