@@ -4,6 +4,7 @@ import {logger} from '../config/logger';
 import {consentRecordRepository} from '../repositories/consentRecordRepository';
 import {userRepository} from '../repositories/userRepository';
 import {presentConsentRecord} from '../utils/consentPresenter';
+import {presentUser} from '../utils/userPresenter';
 import {ComplianceConfigKey, complianceConfigService} from './complianceConfigService';
 
 /** Only the four first-login/re-consent document types have a versioned config key. */
@@ -101,9 +102,10 @@ export const consentService = {
    * reappear on every subsequent app open.
    */
   async acknowledgeWelcomeVideoReprompt(userId: string) {
-    await userRepository.update(userId, {
+    const updated = await userRepository.update(userId, {
       welcomeVideoRepromptPending: false,
       welcomeVideoSeenAt: new Date(),
     });
+    return presentUser(updated);
   },
 };

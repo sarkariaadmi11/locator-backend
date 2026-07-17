@@ -24,7 +24,7 @@ export const accountController = {
   },
 
   async acknowledgeWelcomeVideo(req: AuthenticatedRequest, res: Response) {
-    await consentService.acknowledgeWelcomeVideoReprompt(req.user!.id);
-    sendSuccess(res, 200, 'Welcome video acknowledged.', null);
+    const user = await consentService.acknowledgeWelcomeVideoReprompt(req.user!.id);
+    sendSuccess(res, 200, 'Welcome video acknowledged.', user);
   },
 };

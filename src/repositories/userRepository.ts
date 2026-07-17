@@ -31,10 +31,13 @@ export const userRepository = {
     return prisma.user.update({where: {id}, data: {password: passwordHash}});
   },
 
-  updateLocation(id: string, latitude: number, longitude: number): Promise<User> {
+  // `city` is optional and only overwritten when resolved (reverse-geocode is best-effort and
+  // fires on every GPS ping here, unlike the one-shot onboarding `locationService.save` — a
+  // transient geocode failure shouldn't blank out a previously-known city).
+  updateLocation(id: string, latitude: number, longitude: number, city?: string | null): Promise<User> {
     return prisma.user.update({
       where: {id},
-      data: {latitude, longitude, locationUpdatedAt: new Date()},
+      data: {latitude, longitude, locationUpdatedAt: new Date(), ...(city !== undefined ? {city} : {})},
     });
   },
 

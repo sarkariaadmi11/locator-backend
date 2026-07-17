@@ -6,6 +6,7 @@ import {boundingBox, haversineMeters} from '../utils/geo';
 import {HttpError} from '../utils/httpError';
 import {presentRequest} from '../utils/requestPresenter';
 import {presentUser} from '../utils/userPresenter';
+import {resolveCity} from './locationService';
 import {ratingService} from './ratingService';
 import {trustScoreService} from './trustScoreService';
 import {REQUEST_DEFAULT_RADIUS_METERS} from '../validations/requestValidation';
@@ -16,7 +17,11 @@ const DASHBOARD_ACCEPTED_PREVIEW_LIMIT = 10;
 /** Creator-facing profile/status/dashboard endpoints (PRD §5.5, §5.11, §5.14.1-adjacent). */
 export const creatorService = {
   async updateLocation(userId: string, latitude: number, longitude: number) {
-    const updated = await userRepository.updateLocation(userId, latitude, longitude);
+    const existing = await userRepository.findById(userId);
+    // Only resolve on first fix / when the city is unknown — this endpoint fires on every GPS
+    // ping while the Creator Dashboard is open, so re-geocoding every time would be wasteful.
+    const city = existing && !existing.city ? await resolveCity(latitude, longitude) : undefined;
+    const updated = await userRepository.updateLocation(userId, latitude, longitude, city);
     return presentUser(updated);
   },
 
@@ -75,7 +80,12 @@ export const creatorService = {
       myTrustProfile,
       location:
         user.latitude !== null && user.longitude !== null
-          ? {latitude: user.latitude, longitude: user.longitude, updatedAt: user.locationUpdatedAt?.toISOString() ?? null}
+          ? {
+              latitude: user.latitude,
+              longitude: user.longitude,
+              city: user.city,
+              updatedAt: user.locationUpdatedAt?.toISOString() ?? null,
+            }
           : null,
       nearbyRequestsCount,
       pendingRequests: pendingRequestsPreview,
