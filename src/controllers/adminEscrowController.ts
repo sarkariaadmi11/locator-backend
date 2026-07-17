@@ -33,7 +33,11 @@ export const adminEscrowController = {
   },
 
   async refund(req: AdminRequest, res: Response) {
-    const data = await escrowService.adminRefund(req.admin!.id, req.params.id as string, req.body.reason);
-    sendSuccess(res, 200, 'Escrow refunded to Requester.', data);
+    const {reason, amount} = req.body as {reason: string; amount?: number};
+    const data =
+      amount !== undefined
+        ? await escrowService.adminPartialRefund(req.admin!.id, req.params.id as string, amount, reason)
+        : await escrowService.adminRefund(req.admin!.id, req.params.id as string, reason);
+    sendSuccess(res, 200, amount !== undefined ? 'Escrow partially refunded.' : 'Escrow refunded to Requester.', data);
   },
 };

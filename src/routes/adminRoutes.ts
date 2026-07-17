@@ -9,10 +9,15 @@ import {adminEscrowController} from '../controllers/adminEscrowController';
 import {adminModerationController} from '../controllers/adminModerationController';
 import {adminReportController} from '../controllers/adminReportController';
 import {adminRestrictedLocationController} from '../controllers/adminRestrictedLocationController';
+import {adminNotificationTemplateController} from '../controllers/adminNotificationTemplateController';
+import {adminSettingsController} from '../controllers/adminSettingsController';
 import {adminTrustProfileController} from '../controllers/adminTrustProfileController';
+import {AdminRole} from '@prisma/client';
+
 import {authenticateAdmin} from '../middlewares/adminAuthMiddleware';
 import {asyncHandler} from '../middlewares/asyncHandler';
 import {authRateLimit} from '../middlewares/authRateLimit';
+import {requireRole} from '../middlewares/requireRole';
 import {disputeEvidenceUpload} from '../middlewares/upload';
 import {validate} from '../middlewares/validate';
 import {
@@ -23,6 +28,7 @@ import {
   adminDisputeNoteSchema,
   adminDisputeReopenSchema,
   adminDisputeResolveSchema,
+  adminEscalateDisputeSchema,
   disputeEvidenceCaptionSchema,
   disputeIdParamsSchema,
 } from '../validations/disputeValidation';
@@ -39,6 +45,9 @@ import {
   moderationHistoryQuerySchema,
   moderationQueueQuerySchema,
   moderationVideoIdParamsSchema,
+  pendingRequestIdParamsSchema,
+  pendingRequestsQuerySchema,
+  rejectPendingRequestSchema,
   rejectVideoSchema,
 } from '../validations/moderationValidation';
 import {
@@ -62,6 +71,22 @@ import {
   complianceConfigUpdateSchema,
   deletionLogQuerySchema,
 } from '../validations/accountValidation';
+import {
+  notificationTemplateTypeParamsSchema,
+  upsertNotificationTemplateSchema,
+} from '../validations/notificationTemplateValidation';
+import {
+  applyPresetSchema,
+  presetNameParamsSchema,
+  setModerationToggleSchema,
+  setSettingSchema,
+  settingsKeyParamsSchema,
+} from '../validations/settingsValidation';
+import {
+  adminSuspendUserSchema,
+  adminUserActionReasonSchema,
+  adminWalletAdjustmentSchema,
+} from '../validations/adminUserActionValidation';
 
 export const adminRoutes = Router();
 
@@ -72,6 +97,7 @@ adminRoutes.get('/auth/me', authenticateAdmin, asyncHandler(adminController.me))
 // Dashboard (PRD §5.14.1-§5.14.3, backend Phase 11)
 adminRoutes.get('/dashboard', authenticateAdmin, asyncHandler(adminController.getDashboard));
 adminRoutes.get('/dashboard/live-monitoring', authenticateAdmin, asyncHandler(adminController.getLiveMonitoring));
+adminRoutes.get('/dashboard/live-monitoring/alerts', authenticateAdmin, asyncHandler(adminController.listAlerts));
 adminRoutes.get(
   '/dashboard/active-requests',
   authenticateAdmin,
@@ -81,8 +107,26 @@ adminRoutes.get(
 
 // Users
 adminRoutes.get('/users', authenticateAdmin, asyncHandler(adminController.listUsers));
-adminRoutes.patch('/users/:id/block', authenticateAdmin, asyncHandler(adminController.toggleBlock));
-adminRoutes.patch('/users/:id/suspicious', authenticateAdmin, asyncHandler(adminController.toggleSuspicious));
+adminRoutes.get('/users/:id', authenticateAdmin, asyncHandler(adminController.getUserDetail));
+adminRoutes.patch(
+  '/users/:id/wallet-adjustment',
+  authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
+  validate({body: adminWalletAdjustmentSchema}),
+  asyncHandler(adminController.adjustWallet),
+);
+adminRoutes.patch(
+  '/users/:id/block',
+  authenticateAdmin,
+  validate({body: adminUserActionReasonSchema}),
+  asyncHandler(adminController.toggleBlock),
+);
+adminRoutes.patch(
+  '/users/:id/suspicious',
+  authenticateAdmin,
+  validate({body: adminUserActionReasonSchema}),
+  asyncHandler(adminController.toggleSuspicious),
+);
 
 // Transactions
 adminRoutes.get('/transactions', authenticateAdmin, asyncHandler(adminController.listTransactions));
@@ -92,10 +136,22 @@ adminRoutes.post(
   authenticateAdmin,
   asyncHandler(adminController.reconcilePendingTransactions),
 );
+// Ledger reconciliation report (PRD §5.14.5) — surfaces `ledgerReconciliationJob`'s persisted
+// nightly runs; the job itself is unchanged, this just makes its output visible in the panel.
+adminRoutes.get(
+  '/ledger/reconciliation',
+  authenticateAdmin,
+  asyncHandler(adminController.listLedgerReconciliation),
+);
 
 // Payouts
 adminRoutes.get('/payouts', authenticateAdmin, asyncHandler(adminController.listPayouts));
-adminRoutes.patch('/payouts/:id/process', authenticateAdmin, asyncHandler(adminController.processPayout));
+adminRoutes.patch(
+  '/payouts/:id/process',
+  authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
+  asyncHandler(adminController.processPayout),
+);
 
 // Notifications
 adminRoutes.post('/notifications/token', authenticateAdmin, asyncHandler(adminController.registerFcmToken));
@@ -130,6 +186,34 @@ adminRoutes.delete(
 // capability of the existing Admin JWT namespace, not a separate principal (docs/CLAUDE.md
 // §1/§7) — `authenticateAdmin` alone satisfies "only moderators/admins can moderate; Creator
 // and Requester (both on the `authenticate`/User namespace) cannot."
+// Pre-publish Pending Requests queue (PRD §5.9.2, §5.14.7, TRD §6 ground-truth paths) — distinct
+// entity from the video queue below (a Request before it's ever published, gated by the same
+// MODERATION_TOGGLE wired into requestService.create).
+adminRoutes.get(
+  '/moderation/requests/queue',
+  authenticateAdmin,
+  validate({query: pendingRequestsQuerySchema}),
+  asyncHandler(adminModerationController.requestQueue),
+);
+adminRoutes.get(
+  '/moderation/requests/:requestId',
+  authenticateAdmin,
+  validate({params: pendingRequestIdParamsSchema}),
+  asyncHandler(adminModerationController.requestDetail),
+);
+adminRoutes.post(
+  '/moderation/requests/:requestId/approve',
+  authenticateAdmin,
+  validate({params: pendingRequestIdParamsSchema}),
+  asyncHandler(adminModerationController.approveRequest),
+);
+adminRoutes.post(
+  '/moderation/requests/:requestId/reject',
+  authenticateAdmin,
+  validate({params: pendingRequestIdParamsSchema, body: rejectPendingRequestSchema}),
+  asyncHandler(adminModerationController.rejectRequest),
+);
+
 adminRoutes.get(
   '/moderation/videos',
   authenticateAdmin,
@@ -177,6 +261,21 @@ adminRoutes.patch(
   validate({params: moderationVideoIdParamsSchema, body: rejectVideoSchema}),
   asyncHandler(adminModerationController.reject),
 );
+adminRoutes.post(
+  '/moderation/videos/:videoId/escalate',
+  authenticateAdmin,
+  validate({params: moderationVideoIdParamsSchema, body: adminEscalateDisputeSchema}),
+  asyncHandler(adminModerationController.escalate),
+);
+// TRD §6 ground-truth REST surface: `POST /moderation/users/:id/suspend` — placed in the
+// Moderation module (not the Users module's plain block toggle) since PRD §5.9.2 lists Suspend
+// User as a Moderator-queue action, reason + duration required.
+adminRoutes.post(
+  '/moderation/users/:userId/suspend',
+  authenticateAdmin,
+  validate({body: adminSuspendUserSchema}),
+  asyncHandler(adminModerationController.suspendUser),
+);
 
 // Escrow & Payment Release (PRD §7.1, §7.2, §5.14.5, backend Phase 8) — Refund Management /
 // Finance Management. Release/refund are the same escrowService functions the automatic
@@ -198,12 +297,14 @@ adminRoutes.get(
 adminRoutes.post(
   '/escrow/:id/release',
   authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
   validate({params: escrowRequestIdParamsSchema, body: adminEscrowOverrideSchema}),
   asyncHandler(adminEscrowController.release),
 );
 adminRoutes.post(
   '/escrow/:id/refund',
   authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
   validate({params: escrowRequestIdParamsSchema, body: adminEscrowOverrideSchema}),
   asyncHandler(adminEscrowController.refund),
 );
@@ -333,18 +434,21 @@ adminRoutes.post(
 adminRoutes.patch(
   '/disputes/:id/resolve',
   authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
   validate({params: disputeIdParamsSchema, body: adminDisputeResolveSchema}),
   asyncHandler(adminDisputeController.resolve),
 );
 adminRoutes.patch(
   '/disputes/:id/close',
   authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
   validate({params: disputeIdParamsSchema, body: adminDisputeCloseSchema}),
   asyncHandler(adminDisputeController.close),
 );
 adminRoutes.patch(
   '/disputes/:id/reopen',
   authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
   validate({params: disputeIdParamsSchema, body: adminDisputeReopenSchema}),
   asyncHandler(adminDisputeController.reopen),
 );
@@ -354,6 +458,7 @@ adminRoutes.patch(
 adminRoutes.get(
   '/audit-logs',
   authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
   validate({query: auditLogQuerySchema}),
   asyncHandler(adminAuditLogController.list),
 );
@@ -362,16 +467,92 @@ adminRoutes.get(
 // retention windows/consent versions/grace periods, and the immutable data-deletion audit log
 // (independent of AdminAuditLog above, since most Phase 13 actions are system/scheduled-job
 // driven, not Admin-actor driven).
-adminRoutes.get('/compliance/config', authenticateAdmin, asyncHandler(adminComplianceController.listConfig));
+adminRoutes.get(
+  '/compliance/config',
+  authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
+  asyncHandler(adminComplianceController.listConfig),
+);
 adminRoutes.patch(
   '/compliance/config/:key',
   authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
   validate({params: complianceConfigKeyParamsSchema, body: complianceConfigUpdateSchema}),
   asyncHandler(adminComplianceController.updateConfig),
 );
 adminRoutes.get(
   '/compliance/deletion-logs',
   authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
   validate({query: deletionLogQuerySchema}),
   asyncHandler(adminComplianceController.listDeletionLogs),
+);
+
+// v2.1 Feature Flags / Economy Settings — Admin-only (PRD §5.14.11, backend Phase 6). Single
+// consolidated surface on top of `settingsService`/`PlatformSetting` — every economy value
+// (Request Cost, Creator Reward, Signup Bonus, Daily Connects, Tip bounds, Credit/Connect INR
+// values) and every wired-but-inactive feature flag, plus the dedicated Moderation Toggle
+// endpoints from backend Phase 5.
+// Dedicated Moderation Toggle routes registered before the generic `/settings/:key` below —
+// Express matches PATCH routes in registration order, so the literal path must win first (same
+// "specific before parameterized" convention already used for e.g. `/requests/nearby` above).
+adminRoutes.get(
+  '/settings/moderation-toggle',
+  authenticateAdmin,
+  asyncHandler(adminSettingsController.getModerationToggle),
+);
+adminRoutes.patch(
+  '/settings/moderation-toggle',
+  authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
+  validate({body: setModerationToggleSchema}),
+  asyncHandler(adminSettingsController.setModerationToggle),
+);
+
+// Launch-Stage Presets (PRD §5.14.11, TRD §6 ground-truth paths) — registered before the
+// generic `/settings/:key` below for readability (path shapes don't actually collide — this
+// has 3 extra segments — but grouping with the other named settings routes above).
+adminRoutes.post(
+  '/settings/preset/:name/preview',
+  authenticateAdmin,
+  validate({params: presetNameParamsSchema}),
+  asyncHandler(adminSettingsController.previewPreset),
+);
+adminRoutes.post(
+  '/settings/preset/:name/apply',
+  authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
+  validate({params: presetNameParamsSchema, body: applyPresetSchema}),
+  asyncHandler(adminSettingsController.applyPreset),
+);
+
+adminRoutes.get('/settings', authenticateAdmin, asyncHandler(adminSettingsController.listAll));
+adminRoutes.patch(
+  '/settings/:key',
+  authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
+  validate({params: settingsKeyParamsSchema, body: setSettingSchema}),
+  asyncHandler(adminSettingsController.setSetting),
+);
+
+// Notification Templates (PRD §5.14.9) — Admin-only.
+adminRoutes.get(
+  '/notification-templates',
+  authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
+  asyncHandler(adminNotificationTemplateController.listAll),
+);
+adminRoutes.patch(
+  '/notification-templates/:type',
+  authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
+  validate({params: notificationTemplateTypeParamsSchema, body: upsertNotificationTemplateSchema}),
+  asyncHandler(adminNotificationTemplateController.upsert),
+);
+adminRoutes.delete(
+  '/notification-templates/:type',
+  authenticateAdmin,
+  requireRole(AdminRole.ADMIN),
+  validate({params: notificationTemplateTypeParamsSchema}),
+  asyncHandler(adminNotificationTemplateController.remove),
 );

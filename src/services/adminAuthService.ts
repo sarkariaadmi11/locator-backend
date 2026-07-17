@@ -17,18 +17,18 @@ export const adminAuthService = {
     }
 
     return {
-      admin: {id: admin.id, email: admin.email, name: admin.name},
+      admin: {id: admin.id, email: admin.email, name: admin.name, role: admin.role},
       token: signAdminToken(admin.id),
     };
   },
 
-  async provision(name: string, email: string, password: string) {
+  async provision(name: string, email: string, password: string, role: 'MODERATOR' | 'ADMIN' = 'ADMIN') {
     const existing = await adminRepository.findByEmail(email);
     if (existing) {
       throw new HttpError(409, 'Admin with this email already exists.');
     }
     const passwordHash = await bcrypt.hash(password, 12);
-    const admin = await adminRepository.create({name, email, password: passwordHash});
-    return {id: admin.id, email: admin.email, name: admin.name};
+    const admin = await adminRepository.create({name, email, password: passwordHash, role});
+    return {id: admin.id, email: admin.email, name: admin.name, role: admin.role};
   },
 };

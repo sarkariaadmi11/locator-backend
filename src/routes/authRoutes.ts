@@ -6,11 +6,11 @@ import {authenticate} from '../middlewares/authMiddleware';
 import {authRateLimit} from '../middlewares/authRateLimit';
 import {validate} from '../middlewares/validate';
 import {
-  forgotPasswordSchema,
   loginSchema,
+  refreshTokenSchema,
   registerSchema,
-  resetPasswordSchema,
-  verifyPasswordResetOtpSchema,
+  requestPhoneOtpSchema,
+  verifyPhoneOtpSchema,
   verifyRegistrationOtpSchema,
 } from '../validations/authValidation';
 
@@ -33,23 +33,42 @@ authRoutes.post(
 authRoutes.post('/login', authRateLimit, validate({body: loginSchema}), asyncHandler(authController.login));
 authRoutes.get('/me', authenticate, asyncHandler(authController.me));
 
+// Phone OTP Registration & Login (PRD §5.1.1 "OTP-based phone login (primary)")
 authRoutes.post(
-  '/forgot-password',
+  '/phone/register/request-otp',
   authRateLimit,
-  validate({body: forgotPasswordSchema}),
-  asyncHandler(authController.requestPasswordReset),
+  validate({body: requestPhoneOtpSchema}),
+  asyncHandler(authController.requestPhoneRegistrationOtp),
+);
+authRoutes.post(
+  '/phone/register/verify-otp',
+  authRateLimit,
+  validate({body: verifyPhoneOtpSchema}),
+  asyncHandler(authController.verifyPhoneRegistrationOtp),
+);
+authRoutes.post(
+  '/phone/login/request-otp',
+  authRateLimit,
+  validate({body: requestPhoneOtpSchema}),
+  asyncHandler(authController.requestPhoneLoginOtp),
+);
+authRoutes.post(
+  '/phone/login/verify-otp',
+  authRateLimit,
+  validate({body: verifyPhoneOtpSchema}),
+  asyncHandler(authController.verifyPhoneLoginOtp),
 );
 
+// Refresh Token Rotation & Session Restore (PRD §5.1.1, §11)
 authRoutes.post(
-  '/forgot-password/verify-otp',
+  '/refresh',
   authRateLimit,
-  validate({body: verifyPasswordResetOtpSchema}),
-  asyncHandler(authController.verifyPasswordResetOtp),
+  validate({body: refreshTokenSchema}),
+  asyncHandler(authController.refresh),
 );
-
 authRoutes.post(
-  '/reset-password',
+  '/logout',
   authRateLimit,
-  validate({body: resetPasswordSchema}),
-  asyncHandler(authController.resetPassword),
+  validate({body: refreshTokenSchema}),
+  asyncHandler(authController.logout),
 );

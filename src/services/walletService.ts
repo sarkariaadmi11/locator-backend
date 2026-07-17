@@ -7,10 +7,24 @@ import {logger} from '../config/logger';
 import {prisma} from '../prisma/client';
 import {payoutRequestRepository} from '../repositories/payoutRequestRepository';
 import {transactionRepository} from '../repositories/transactionRepository';
+import {ledgerService} from './ledgerService';
 import {notificationService} from './notificationService';
 import {NotificationType} from './notificationTypes';
+import {settingsService} from './settingsService';
 import {HttpError} from '../utils/httpError';
 import {presentUser} from '../utils/userPresenter';
+
+/**
+ * v2.1 real-money gate (PRD_TRD_SUMMARY.md §1, backend Phase 2 item 4, docs/CLAUDE.md §2.1).
+ * Beta Mode (the v2.1 default launch mode) has no real-money top-up/withdrawal at all — only
+ * these three Razorpay-backed flows are gated; escrow/request creation remain unconditional
+ * INR until Phase 2 item 5 (currency-aware escrow) lands.
+ */
+function assertRealMoneyEnabled() {
+  if (!env.ENABLE_REAL_MONEY) {
+    throw new HttpError(403, 'Real-money wallet features are disabled in Beta Mode.');
+  }
+}
 
 const razorpay = new Razorpay({
   key_id: env.RAZORPAY_KEY_ID,
@@ -31,7 +45,22 @@ function timingSafeEqualHex(expectedHex: string, providedHex: string): boolean {
 }
 
 export const walletService = {
+  /**
+   * v2.1 dual-currency wallet view (PRD_TRD_SUMMARY.md §4.3, backend Phase 2). Also opportunistically
+   * grants the Daily Free Connects bonus if due today (TRD 9 "event-driven, on first API call of
+   * the day" — GET /wallet is the natural hook since mobile fetches it on every app-open).
+   */
+  async getWallet(userId: string) {
+    await ledgerService.grantDailyConnectBonusIfDue(userId);
+    const balances = await ledgerService.getBalances(userId);
+    // v2.1 client mode-detection signal (PRD_TRD_SUMMARY.md §1, mobile Phase 0 gap — no public
+    // endpoint exposed which economy mode is active until this addition). Runtime/server-driven
+    // per the mobile plan's own recommendation, so a mode switch never needs an app store release.
+    return {...balances, realMoneyEnabled: env.ENABLE_REAL_MONEY};
+  },
+
   async createOrder(userId: string, amount: number) {
+    assertRealMoneyEnabled();
     let order;
     try {
       order = await razorpay.orders.create({
@@ -72,6 +101,7 @@ export const walletService = {
     razorpayPaymentId: string,
     razorpaySignature: string,
   ) {
+    assertRealMoneyEnabled();
     const expected = crypto
       .createHmac('sha256', env.RAZORPAY_KEY_SECRET)
       .update(`${razorpayOrderId}|${razorpayPaymentId}`)
@@ -216,6 +246,7 @@ export const walletService = {
   },
 
   async withdraw(userId: string, amount: number) {
+    assertRealMoneyEnabled();
     const user = await prisma.user.findUnique({where: {id: userId}});
     if (!user) {
       throw new HttpError(404, 'User not found.');
@@ -230,10 +261,49 @@ export const walletService = {
       throw new HttpError(409, 'You already have a pending payout request.');
     }
 
-    await payoutRequestRepository.create({
+    const payout = await payoutRequestRepository.create({
       user: {connect: {id: userId}},
       amount,
     });
+
+    // Auto-Payout Toggle (PRD §5.14.5/§4.8/§9.2 "Auto-Payout Toggle. Payout approval queue when
+    // OFF."). ON: process immediately below, same debit mechanism the Admin "approve" action
+    // uses (`adminService.processPayout`) — this codebase has no RazorpayX payout-API
+    // integration yet (only Razorpay Checkout for top-up), so "auto-processed" here means
+    // "auto-approved, skipping the manual admin queue," matching every other admin-approval
+    // action's actual money-movement mechanism. OFF (default, current-only behavior until this
+    // toggle exists): unchanged — PENDING queue entry, admin notified.
+    if (await settingsService.isAutoPayoutEnabled()) {
+      await transactionRepository.runTransaction([
+        prisma.payoutRequest.update({
+          where: {id: payout.id},
+          data: {status: 'APPROVED', adminNote: 'Auto-processed (Auto-Payout Toggle ON)', processedAt: new Date()},
+        }),
+        prisma.transaction.create({
+          data: {
+            userId,
+            type: 'DEBIT',
+            amount,
+            status: 'SUCCESS',
+            description: 'Payout withdrawal auto-processed',
+          },
+        }),
+        prisma.user.update({
+          where: {id: userId},
+          data: {walletBalance: {decrement: amount}},
+        }),
+      ]);
+
+      await notificationService.notifyUser(
+        userId,
+        NotificationType.PAYOUT_APPROVED,
+        'Withdrawal Processed ✓',
+        `Your withdrawal of ₹${amount.toFixed(2)} has been processed and deducted from your wallet.`,
+        {payoutId: payout.id, amount: amount.toFixed(2), screen: 'Wallet'},
+      );
+
+      return {message: 'Payout processed automatically.'};
+    }
 
     await notificationService.notifyAdmins(
       NotificationType.PAYOUT_REQUEST,

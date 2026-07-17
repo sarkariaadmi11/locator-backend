@@ -98,7 +98,9 @@ describe('requestService.accept — Creator mutex (integration)', () => {
     });
 
     const finalRequest = await prisma.request.findUniqueOrThrow({where: {id: request.id}});
-    expect(finalRequest.status).toBe('TEMPORARY_CHAT');
+    // CREATOR_ASSIGNED is the v2.1 resting state after acceptance (backend Phase 4 item 2
+    // retired the old TEMPORARY_CHAT interstitial from this flow — see requestService.accept).
+    expect(finalRequest.status).toBe('CREATOR_ASSIGNED');
     expect([creatorAId, creatorBId]).toContain(finalRequest.creatorId);
 
     // The Redis lock must still be held by the winner (not left dangling/released) so a late

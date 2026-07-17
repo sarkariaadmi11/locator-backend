@@ -7,6 +7,7 @@ import {escrowService} from './escrowService';
 import {ComplianceConfigKey, complianceConfigService} from './complianceConfigService';
 import {notificationService} from './notificationService';
 import {NotificationType} from './notificationTypes';
+import {verifiedCreatorService} from './verifiedCreatorService';
 import {MAX_RESHOOT_ATTEMPTS} from '../validations/requesterReviewValidation';
 
 /**
@@ -74,6 +75,18 @@ export const requesterReviewService = {
 
     assertTransition('PAYMENT_RELEASED', 'COMPLETED');
     const updated = await requestRepository.update(requestId, {status: 'COMPLETED'});
+
+    // Verified Creator Badge re-evaluation (PRD_TRD_SUMMARY.md §4.12, backend Phase 7) —
+    // event-driven on every Completed transition, per TRD 9. Awaited (not fire-and-forget) so
+    // the badge state is guaranteed current by the time this call returns, but wrapped so a
+    // failure here can never block the Requester's Accept action from completing.
+    if (updated.creatorId) {
+      try {
+        await verifiedCreatorService.evaluate(updated.creatorId);
+      } catch {
+        // Best-effort — the next Completed transition or rating will re-evaluate anyway.
+      }
+    }
 
     // "Payment Completed" (Escrow matrix item) — distinct from escrowService's "Payment
     // Released" (which goes to the Creator confirming their payout): this confirms to the

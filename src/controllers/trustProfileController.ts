@@ -9,8 +9,11 @@ export const trustProfileController = {
   /** `GET /trust-profile/me?role=requester|creator` — own profile, defaults to requester. */
   async me(req: AuthenticatedRequest, res: Response) {
     const role = (req.query.role as 'requester' | 'creator' | undefined) ?? 'requester';
-    const data = await trustScoreService.getProfile(req.user!.id, role);
-    await trustScoreService.checkAndNotifyChanges(req.user!.id, data);
+    // checkAndNotifyChanges needs the full (unstripped) profile for its internal score-change
+    // bookkeeping (see trustScoreService.ts) — the response sent to the client is the stripped one.
+    const fullProfile = await trustScoreService.getProfile(req.user!.id, role);
+    await trustScoreService.checkAndNotifyChanges(req.user!.id, fullProfile);
+    const data = await trustScoreService.getUserFacingProfile(req.user!.id, role);
     sendSuccess(res, 200, 'Trust profile fetched.', data);
   },
 
@@ -22,7 +25,7 @@ export const trustProfileController = {
    */
   async byUserId(req: AuthenticatedRequest, res: Response) {
     const role = (req.query.role as 'requester' | 'creator' | undefined) ?? 'requester';
-    const data = await trustScoreService.getProfile(req.params.userId as string, role);
+    const data = await trustScoreService.getUserFacingProfile(req.params.userId as string, role);
     sendSuccess(res, 200, 'Trust profile fetched.', data);
   },
 };

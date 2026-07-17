@@ -2,15 +2,14 @@ import {logger} from '../config/logger';
 import {chatRepository} from '../repositories/chatRepository';
 import {dataDeletionLogRepository} from '../repositories/dataDeletionLogRepository';
 import {notificationRepository} from '../repositories/notificationRepository';
-import {passwordResetOtpRepository} from '../repositories/passwordResetOtpRepository';
+import {phoneOtpRepository} from '../repositories/phoneOtpRepository';
+import {refreshTokenRepository} from '../repositories/refreshTokenRepository';
 import {registrationOtpRepository} from '../repositories/registrationOtpRepository';
 import {requestRepository} from '../repositories/requestRepository';
 import {requestVideoRepository} from '../repositories/requestVideoRepository';
 import {userRepository} from '../repositories/userRepository';
 import {videoStorageProvider} from './storage';
 import {ComplianceConfigKey, complianceConfigService} from './complianceConfigService';
-import {notificationService} from './notificationService';
-import {NotificationType} from './notificationTypes';
 import {requestLifecycleJob} from './requestLifecycleJob';
 import {TERMINAL_STATUSES} from './requestStateMachine';
 
@@ -108,9 +107,10 @@ export const retentionJob = {
     const inactiveDays = await complianceConfigService.getNumber(ComplianceConfigKey.INACTIVE_ACCOUNT_DAYS);
     const now = new Date();
 
-    const [expiredRegistrations, expiredResets] = await Promise.all([
+    const [expiredRegistrations, expiredPhoneOtps, expiredRefreshTokens] = await Promise.all([
       registrationOtpRepository.deleteExpired(now),
-      passwordResetOtpRepository.deleteExpired(now),
+      phoneOtpRepository.deleteExpired(now),
+      refreshTokenRepository.deleteExpired(now),
     ]);
 
     const staleUsers = await userRepository.findInactiveWithFcmToken(daysAgo(inactiveDays));
@@ -118,21 +118,23 @@ export const retentionJob = {
       await userRepository.clearFcmToken(user.id);
     }
 
-    const total = expiredRegistrations.count + expiredResets.count + staleUsers.length;
+    const total = expiredRegistrations.count + expiredPhoneOtps.count + expiredRefreshTokens.count + staleUsers.length;
     if (total > 0) {
       await dataDeletionLogRepository.create({
         action: 'INACTIVE_ACCOUNT_CLEANED',
         entityType: 'User',
         metadata: {
           expiredRegistrationOtps: expiredRegistrations.count,
-          expiredPasswordResetOtps: expiredResets.count,
+          expiredPhoneOtps: expiredPhoneOtps.count,
+          expiredRefreshTokens: expiredRefreshTokens.count,
           staleFcmTokensCleared: staleUsers.length,
           inactiveDays,
         },
       });
       logger.info(
         `[retentionJob.cleanupInactiveAccounts] Cleaned ${expiredRegistrations.count} registration OTP(s), ` +
-          `${expiredResets.count} password-reset OTP(s), ${staleUsers.length} stale FCM token(s).`,
+          `${expiredPhoneOtps.count} phone OTP(s), ${expiredRefreshTokens.count} refresh token(s), ` +
+          `${staleUsers.length} stale FCM token(s).`,
       );
     }
     return total;
@@ -159,41 +161,19 @@ export const retentionJob = {
   },
 
   /**
-   * Account Deletion hard-delete scheduler — anonymizes (never literally row-deletes, see
-   * `accountDeletionService`'s file comment) every account whose grace period has elapsed.
+   * Suspend User auto-reactivation (PRD §5.9.2) — lifts any time-boxed suspension whose
+   * `suspendedUntil` has elapsed. Never touches an indefinite `toggleBlock` (which leaves
+   * `suspendedUntil` null, so it's simply never selected here).
    */
-  async executeScheduledHardDeletes() {
-    const candidates = await userRepository.findScheduledForHardDelete(new Date());
-    let deleted = 0;
-
+  async reactivateExpiredSuspensions() {
+    const candidates = await userRepository.findExpiredSuspensions(new Date());
     for (const user of candidates) {
-      try {
-        // Sent before anonymizing — the FCM token/Notification-row-readable account still exists
-        // for this one last call (bypasses preferences, ACCOUNT_HARD_DELETED is safety-critical).
-        await notificationService.notifyUser(
-          user.id,
-          NotificationType.ACCOUNT_HARD_DELETED,
-          'Account deleted',
-          'Your account and personal data have been permanently deleted, as requested.',
-          {screen: 'Notifications'},
-        );
-        await userRepository.anonymize(user.id);
-        await dataDeletionLogRepository.create({
-          userId: user.id,
-          action: 'ACCOUNT_HARD_DELETED',
-          entityType: 'User',
-          entityId: user.id,
-        });
-        deleted += 1;
-      } catch (err) {
-        logger.error(`[retentionJob.executeScheduledHardDeletes] Failed for user=${user.id}: ${(err as Error).message}`);
-      }
+      await userRepository.reactivateExpiredSuspension(user.id);
     }
-
-    if (deleted > 0) {
-      logger.info(`[retentionJob.executeScheduledHardDeletes] Hard-deleted ${deleted} account(s).`);
+    if (candidates.length > 0) {
+      logger.info(`[retentionJob.reactivateExpiredSuspensions] Reactivated ${candidates.length} account(s).`);
     }
-    return deleted;
+    return candidates.length;
   },
 
   async runSweep() {
@@ -202,14 +182,14 @@ export const retentionJob = {
     const notificationsPurged = await this.purgeExpiredNotifications();
     const inactiveAccountsCleaned = await this.cleanupInactiveAccounts();
     const expiredDraftsCleaned = await this.cleanupExpiredDrafts();
-    const accountsHardDeleted = await this.executeScheduledHardDeletes();
+    const suspensionsReactivated = await this.reactivateExpiredSuspensions();
     return {
       chatMessagesPurged,
       videoAssetsPurged,
       notificationsPurged,
       inactiveAccountsCleaned,
       expiredDraftsCleaned,
-      accountsHardDeleted,
+      suspensionsReactivated,
     };
   },
 };

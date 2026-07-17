@@ -21,16 +21,23 @@ export const loginSchema = z.object({
   password: z.string().min(8).max(128),
 });
 
-export const forgotPasswordSchema = z.object({
-  email: z.string().trim().email().toLowerCase(),
+// Phone OTP auth (PRD §5.1.1, §5.1.2). Loose regex here — `utils/phone.ts#normalizePhone` does
+// the authoritative validation/normalization inside the service; this just rejects obviously
+// malformed input before it reaches the DB layer.
+const phoneSchema = z
+  .string()
+  .trim()
+  .regex(/^(\+?91)?[6-9]\d{9}$/, 'Please enter a valid 10-digit Indian mobile number.');
+
+export const requestPhoneOtpSchema = z.object({
+  phone: phoneSchema,
 });
 
-export const verifyPasswordResetOtpSchema = z.object({
-  email: z.string().trim().email().toLowerCase(),
-  otp: z.string().trim().regex(/^\d{6}$/, 'OTP must be a 6-digit code.'),
+export const verifyPhoneOtpSchema = z.object({
+  phone: phoneSchema,
+  otp: z.string().trim().regex(/^\d{6}$/, 'OTP must be a 6 digit code.'),
 });
 
-export const resetPasswordSchema = z.object({
-  resetToken: z.string().min(1),
-  password: z.string().min(8).max(128),
+export const refreshTokenSchema = z.object({
+  refreshToken: z.string().min(1, 'Refresh token is required.'),
 });

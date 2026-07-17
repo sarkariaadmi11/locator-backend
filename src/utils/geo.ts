@@ -14,6 +14,35 @@ export function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: 
   return EARTH_RADIUS_METERS * c;
 }
 
+/**
+ * Recording-GPS-vs-request-pin comparison (PRD §5.9.2 "GPS Map View") — shared by the
+ * Moderation queue detail (`moderationPresenter.ts`) and the Dispute detail admin view
+ * (`disputeService.adminDetail`), so both surfaces compute the same verdict the same way.
+ */
+export function buildGpsCheck(
+  request: {latitude: number; longitude: number; radiusMeters: number},
+  video: {gpsLatitude: number | null; gpsLongitude: number | null} | null,
+) {
+  const distanceMeters =
+    video?.gpsLatitude != null && video?.gpsLongitude != null
+      ? Math.round(haversineMeters(video.gpsLatitude, video.gpsLongitude, request.latitude, request.longitude))
+      : null;
+
+  return {
+    requestLocation: {
+      latitude: request.latitude,
+      longitude: request.longitude,
+      radiusMeters: request.radiusMeters,
+    },
+    recordingLocation:
+      video?.gpsLatitude != null && video?.gpsLongitude != null
+        ? {latitude: video.gpsLatitude, longitude: video.gpsLongitude}
+        : null,
+    distanceMeters,
+    withinRadius: distanceMeters === null ? null : distanceMeters <= request.radiusMeters,
+  };
+}
+
 export type BoundingBox = {minLat: number; maxLat: number; minLng: number; maxLng: number};
 
 /**

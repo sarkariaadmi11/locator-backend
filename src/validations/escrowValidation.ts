@@ -20,4 +20,7 @@ export const adminEscrowListQuerySchema = z.object({
 
 export const adminEscrowOverrideSchema = z.object({
   reason: z.string().trim().min(5, 'A reason is required for a manual override.').max(300),
+  // Refund Management (PRD §5.14.5/§5.14.6 "full/partial") — omitted or absent means a full
+  // refund (existing behavior); the release endpoint ignores this field entirely.
+  amount: z.coerce.number().positive().optional(),
 });

@@ -1,6 +1,6 @@
 import {Request, RequestVideo, User} from '@prisma/client';
 
-import {haversineMeters} from './geo';
+import {buildGpsCheck} from './geo';
 import {presentRequest} from './requestPresenter';
 import {presentRequestVideo} from './requestVideoPresenter';
 
@@ -42,27 +42,11 @@ export const presentModerationQueueItem = (video: VideoWithModerationContext) =>
 /** Full video-review detail — video player data, GPS map comparison, timestamp check (PRD §5.9). */
 export const presentModerationVideoDetail = (video: VideoWithModerationContext) => {
   const {request} = video;
-  const distanceMeters =
-    video.gpsLatitude !== null && video.gpsLongitude !== null
-      ? Math.round(haversineMeters(video.gpsLatitude, video.gpsLongitude, request.latitude, request.longitude))
-      : null;
 
   return {
     ...presentModerationQueueItem(video),
     request: presentRequest(request),
-    gpsCheck: {
-      requestLocation: {
-        latitude: request.latitude,
-        longitude: request.longitude,
-        radiusMeters: request.radiusMeters,
-      },
-      recordingLocation:
-        video.gpsLatitude !== null && video.gpsLongitude !== null
-          ? {latitude: video.gpsLatitude, longitude: video.gpsLongitude}
-          : null,
-      distanceMeters,
-      withinRadius: distanceMeters === null ? null : distanceMeters <= request.radiusMeters,
-    },
+    gpsCheck: buildGpsCheck(request, video),
     timestampCheck: {
       recordedAt: video.recordedAt?.toISOString() ?? null,
       requestAcceptedAt: request.acceptedAt?.toISOString() ?? null,

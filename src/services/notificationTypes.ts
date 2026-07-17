@@ -24,11 +24,24 @@ export const NotificationType = {
   CREATOR_TIMED_OUT: 'CREATOR_TIMED_OUT',
   REQUEST_CANCELLED: 'REQUEST_CANCELLED',
   REQUEST_EXPIRED: 'REQUEST_EXPIRED',
+  // Pre-publish Pending Requests queue (PRD §5.9.2, §5.14.7) — a Moderator/Admin rejected the
+  // request before it was ever published/broadcast to Creators; full refund accompanies this.
+  REQUEST_REJECTED: 'REQUEST_REJECTED',
+  // Highest Rated acceptance mode matching window (PRD_TRD_SUMMARY.md §5.6/§5.7/§7.4 item 5,
+  // backend Phase 4 item 4) — sent to a Creator who responded but didn't win the window, and to
+  // the Requester if the window closes with zero responses (falls back to First Accepted).
+  MATCHING_WINDOW_LOST: 'MATCHING_WINDOW_LOST',
+  MATCHING_WINDOW_FALLBACK: 'MATCHING_WINDOW_FALLBACK',
 
-  // Temporary Chat
+  // Temporary Chat (v2.0, superseded — see docs/CLAUDE.md §2.2. Kept for any pre-existing row.)
   CHAT_OPENED: 'CHAT_OPENED',
   NEW_MESSAGE: 'NEW_MESSAGE',
   CHAT_CLOSED: 'CHAT_CLOSED',
+
+  // Pre-Acceptance Query (PRD_TRD_SUMMARY.md §4.6, backend Phase 4 — v2.1 replacement for the
+  // post-acceptance chat above).
+  QUERY_RECEIVED: 'QUERY_RECEIVED',
+  QUERY_REPLY_RECEIVED: 'QUERY_REPLY_RECEIVED',
 
   // Recording
   RECORDING_STARTED: 'RECORDING_STARTED',
@@ -44,6 +57,9 @@ export const NotificationType = {
   // Requester Review
   VIDEO_READY: 'VIDEO_READY',
   REVIEW_REMINDER: 'REVIEW_REMINDER',
+  // v2.1 48h auto-accept (PRD_TRD_SUMMARY.md §5.8, backend Phase 3 item 5) — 42h warning, distinct
+  // from the pre-existing 2h REVIEW_REMINDER above (different trigger, different message).
+  REVIEW_AUTO_ACCEPT_WARNING: 'REVIEW_AUTO_ACCEPT_WARNING',
   VIDEO_ACCEPTED: 'VIDEO_ACCEPTED',
   RESHOOT_REQUESTED: 'RESHOOT_REQUESTED',
   VIDEO_REQUESTER_REJECTED: 'VIDEO_REQUESTER_REJECTED',
@@ -53,6 +69,8 @@ export const NotificationType = {
   PAYMENT_RELEASED: 'PAYMENT_RELEASED',
   REFUND_ISSUED: 'REFUND_ISSUED',
   PAYMENT_COMPLETED: 'PAYMENT_COMPLETED',
+  // Tipping (PRD §5.15, backend Phase 2) — post-Completed, non-blocking, one-way (Requester -> Creator).
+  TIP_RECEIVED: 'TIP_RECEIVED',
 
   // Ratings
   RATING_REMINDER: 'RATING_REMINDER',
@@ -99,6 +117,9 @@ export const NotificationType = {
   HIGH_PRIORITY_REPORT: 'HIGH_PRIORITY_REPORT',
   HIGH_VALUE_ESCROW: 'HIGH_VALUE_ESCROW',
   LARGE_REFUND: 'LARGE_REFUND',
+  // GPS spoofing / mock-location signal (PRD_TRD_SUMMARY.md §5.10, backend Phase 8 item 2) —
+  // flag-and-queue only, never auto-block (explicit MVP policy, repeated throughout the PRD).
+  GPS_SPOOFING_SUSPECTED: 'GPS_SPOOFING_SUSPECTED',
   // Monitoring/alerting (PRD §11, backend Phase 14) — moderation-queue depth, pending-payout
   // queue depth, and failed-webhook rate all crossing their documented thresholds.
   SYSTEM_THRESHOLD_ALERT: 'SYSTEM_THRESHOLD_ALERT',
@@ -132,10 +153,15 @@ export const NOTIFICATION_TYPE_CATEGORY: Partial<Record<NotificationTypeValue, N
   [T.CREATOR_TIMED_OUT]: C.REQUEST_ACTIVITY,
   [T.REQUEST_CANCELLED]: C.REQUEST_ACTIVITY,
   [T.REQUEST_EXPIRED]: C.REQUEST_ACTIVITY,
+  [T.REQUEST_REJECTED]: C.REQUEST_ACTIVITY,
+  [T.MATCHING_WINDOW_LOST]: C.REQUEST_ACTIVITY,
+  [T.MATCHING_WINDOW_FALLBACK]: C.REQUEST_ACTIVITY,
 
   [T.CHAT_OPENED]: C.REQUEST_ACTIVITY,
   [T.NEW_MESSAGE]: C.REQUEST_ACTIVITY,
   [T.CHAT_CLOSED]: C.REQUEST_ACTIVITY,
+  [T.QUERY_RECEIVED]: C.REQUEST_ACTIVITY,
+  [T.QUERY_REPLY_RECEIVED]: C.REQUEST_ACTIVITY,
 
   [T.RECORDING_STARTED]: C.REQUEST_ACTIVITY,
   [T.RECORDING_REMINDER]: C.REQUEST_ACTIVITY,
@@ -148,6 +174,7 @@ export const NOTIFICATION_TYPE_CATEGORY: Partial<Record<NotificationTypeValue, N
 
   [T.VIDEO_READY]: C.REQUEST_ACTIVITY,
   [T.REVIEW_REMINDER]: C.REQUEST_ACTIVITY,
+  [T.REVIEW_AUTO_ACCEPT_WARNING]: C.REQUEST_ACTIVITY,
   [T.VIDEO_ACCEPTED]: C.REQUEST_ACTIVITY,
   [T.RESHOOT_REQUESTED]: C.REQUEST_ACTIVITY,
   [T.VIDEO_REQUESTER_REJECTED]: C.REQUEST_ACTIVITY,
@@ -156,6 +183,7 @@ export const NOTIFICATION_TYPE_CATEGORY: Partial<Record<NotificationTypeValue, N
   [T.PAYMENT_RELEASED]: C.PAYMENT_WALLET,
   [T.REFUND_ISSUED]: C.PAYMENT_WALLET,
   [T.PAYMENT_COMPLETED]: C.PAYMENT_WALLET,
+  [T.TIP_RECEIVED]: C.PAYMENT_WALLET,
 
   [T.RATING_REMINDER]: C.REQUEST_ACTIVITY,
   [T.RATING_RECEIVED]: C.REQUEST_ACTIVITY,

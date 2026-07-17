@@ -1,7 +1,8 @@
 import {Response} from 'express';
-import {VideoModerationStatus, VideoRejectionReason} from '@prisma/client';
+import {DisputeReason, VideoModerationStatus, VideoRejectionReason} from '@prisma/client';
 
 import {AdminRequest} from '../middlewares/adminAuthMiddleware';
+import {adminService} from '../services/adminService';
 import {moderationService} from '../services/moderationService';
 import {sendSuccess} from '../utils/apiResponse';
 
@@ -75,5 +76,42 @@ export const adminModerationController = {
     };
     const data = await moderationService.bulkReject(req.admin!.id, videoIds, reason, remarks);
     sendSuccess(res, 200, 'Bulk rejection processed.', data);
+  },
+
+  async escalate(req: AdminRequest, res: Response) {
+    const {reason, description} = req.body as {reason: DisputeReason; description: string};
+    const data = await moderationService.escalate(req.admin!.id, req.params.videoId as string, reason, description);
+    sendSuccess(res, 201, 'Escalated to Dispute Center.', data);
+  },
+
+  /** PRD §5.9.2 "Suspend User button (reason + duration)" — Moderator-queue-specific action. */
+  async suspendUser(req: AdminRequest, res: Response) {
+    const {reason, durationHours} = req.body as {reason: string; durationHours: number};
+    const data = await adminService.suspendUser(req.admin!.id, req.params.userId as string, reason, durationHours);
+    sendSuccess(res, 200, 'User suspended.', data);
+  },
+
+  // --- Pre-publish Pending Requests queue (PRD §5.9.2, §5.14.7, TRD §6 `GET
+  // /moderation/requests/queue`, `POST /moderation/requests/:id/approve|reject`) ------------
+
+  async requestQueue(req: AdminRequest, res: Response) {
+    const {page, limit} = req.query as unknown as {page: number; limit: number};
+    const data = await moderationService.getRequestQueue(page, limit);
+    sendSuccess(res, 200, 'Pending requests fetched.', data);
+  },
+
+  async requestDetail(req: AdminRequest, res: Response) {
+    const data = await moderationService.getRequestDetail(req.params.requestId as string);
+    sendSuccess(res, 200, 'Pending request detail fetched.', data);
+  },
+
+  async approveRequest(req: AdminRequest, res: Response) {
+    const data = await moderationService.approveRequest(req.admin!.id, req.params.requestId as string);
+    sendSuccess(res, 200, 'Request approved and published.', data);
+  },
+
+  async rejectRequest(req: AdminRequest, res: Response) {
+    const data = await moderationService.rejectRequest(req.admin!.id, req.params.requestId as string, req.body.reason);
+    sendSuccess(res, 200, 'Request rejected.', data);
   },
 };

@@ -55,6 +55,9 @@ export const ComplianceConfigKey = {
   // already-reserved escrow's split — same pattern as every other "configurable, not hardcoded"
   // value in this file.
   COMMISSION_RATE_PERCENT: 'COMMISSION_RATE_PERCENT',
+  // PRD §5.9.2 "Pending Videos queue... SLA countdown vs. 2h target" — the Moderation queue's
+  // per-video overdue indicator counts against this, off `RequestVideo.createdAt`.
+  VIDEO_REVIEW_SLA_HOURS: 'VIDEO_REVIEW_SLA_HOURS',
 } as const;
 
 export type ComplianceConfigKeyValue = (typeof ComplianceConfigKey)[keyof typeof ComplianceConfigKey];
@@ -111,6 +114,10 @@ const DEFAULTS: Record<ComplianceConfigKeyValue, {value: string; description: st
     value: '15',
     description: '[REVIEW] Platform commission %, snapshotted onto each escrow at reservation time (PRD §5.2, §7.1).',
   },
+  [ComplianceConfigKey.VIDEO_REVIEW_SLA_HOURS]: {
+    value: '2',
+    description: 'PRD §5.9.2 target hours for a Moderator to review a pending video before it counts as overdue.',
+  },
 };
 
 /** Keys whose `value` must be a plain number, validated in `adminUpdate` before it's persisted. */
@@ -126,6 +133,7 @@ const NUMERIC_KEYS: ReadonlySet<ComplianceConfigKeyValue> = new Set([
   ComplianceConfigKey.DRAFT_CLEANUP_GRACE_HOURS,
   ComplianceConfigKey.CONSECUTIVE_REJECTIONS_REPROMPT_THRESHOLD,
   ComplianceConfigKey.COMMISSION_RATE_PERCENT,
+  ComplianceConfigKey.VIDEO_REVIEW_SLA_HOURS,
 ]);
 
 let seeded = false;

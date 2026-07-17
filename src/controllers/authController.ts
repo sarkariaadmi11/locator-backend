@@ -28,11 +28,43 @@ export const authController = {
     sendSuccess(res, 200, 'Login successful.', data);
   },
 
+  async requestPhoneRegistrationOtp(req: Request, res: Response) {
+    const data = await authService.requestPhoneRegistrationOtp(req.body.phone);
+    sendSuccess(res, 200, 'OTP sent.', data);
+  },
+
+  async verifyPhoneRegistrationOtp(req: Request, res: Response) {
+    const data = await authService.verifyPhoneRegistrationOtp(req.body.phone, req.body.otp);
+    sendSuccess(res, 201, 'Registration successful.', data);
+  },
+
+  async requestPhoneLoginOtp(req: Request, res: Response) {
+    const data = await authService.requestPhoneLoginOtp(req.body.phone);
+    sendSuccess(res, 200, 'OTP sent.', data);
+  },
+
+  async verifyPhoneLoginOtp(req: Request, res: Response) {
+    const data = await authService.verifyPhoneLoginOtp(req.body.phone, req.body.otp);
+    sendSuccess(res, 200, 'Login successful.', data);
+  },
+
+  async refresh(req: Request, res: Response) {
+    const data = await authService.refresh(req.body.refreshToken);
+    sendSuccess(res, 200, 'Session refreshed.', data);
+  },
+
+  async logout(req: Request, res: Response) {
+    await authService.logout(req.body.refreshToken);
+    sendSuccess(res, 200, 'Logged out successfully.', null);
+  },
+
   async me(req: AuthenticatedRequest, res: Response) {
+    // v2.1 (backend Phase 7): Trust Score removed from MVP display entirely, including self-view
+    // — trustScoreService.getUserFacingProfile strips it.
     const [ratingSummary, requesterTrustProfile, creatorTrustProfile] = await Promise.all([
       ratingService.getSummaryForUser(req.user!.id),
-      trustScoreService.getProfile(req.user!.id, 'requester'),
-      trustScoreService.getProfile(req.user!.id, 'creator'),
+      trustScoreService.getUserFacingProfile(req.user!.id, 'requester'),
+      trustScoreService.getUserFacingProfile(req.user!.id, 'creator'),
     ]);
     sendSuccess(res, 200, 'Authenticated user fetched.', {
       ...presentUser(req.user!),
@@ -40,20 +72,5 @@ export const authController = {
       requesterTrustProfile,
       creatorTrustProfile,
     });
-  },
-
-  async requestPasswordReset(req: Request, res: Response) {
-    const data = await authService.requestPasswordReset(req.body.email);
-    sendSuccess(res, 200, 'Password reset code sent.', data);
-  },
-
-  async verifyPasswordResetOtp(req: Request, res: Response) {
-    const data = await authService.verifyPasswordResetOtp(req.body);
-    sendSuccess(res, 200, 'OTP verified.', data);
-  },
-
-  async resetPassword(req: Request, res: Response) {
-    await authService.resetPassword(req.body);
-    sendSuccess(res, 200, 'Password reset successfully.', null);
   },
 };

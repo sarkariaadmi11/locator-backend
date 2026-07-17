@@ -9,6 +9,12 @@ const envSchema = z.object({
   DATABASE_URL: z.string().min(1),
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters.'),
   JWT_EXPIRES_IN: z.string().default('7d'),
+  // Session management (PRD §5.1.1 "JWT tokens (24-hour expiry; refresh token 30-day expiry)",
+  // §11 "Security — Auth"). Applies to user access tokens (both phone-OTP and email flows —
+  // "Proper JWT Expiry" is a platform-wide auth requirement, not phone-only); `JWT_EXPIRES_IN`
+  // above is left untouched and still governs the separate Admin token (signAdminToken).
+  ACCESS_TOKEN_EXPIRES_IN: z.string().default('24h'),
+  REFRESH_TOKEN_EXPIRES_DAYS: z.coerce.number().int().positive().default(30),
   CORS_ORIGIN: z.string().default('*'),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().default(15 * 60 * 1000),
   RATE_LIMIT_MAX: z.coerce.number().default(100),
@@ -20,6 +26,28 @@ const envSchema = z.object({
   RAZORPAY_KEY_SECRET: z.string().min(1),
   RAZORPAY_WEBHOOK_SECRET: z.string().optional(),
   OTP_EXPIRES_MINUTES: z.coerce.number().int().positive().default(10),
+  // Phone OTP auth (PRD §5.1.1, §5.1.2) — deliberately separate from the email registration OTP
+  // settings above; PRD §5.1.2 specifies 60-second expiry / 3 attempts / 5-minute lockout for
+  // phone OTP specifically.
+  PHONE_OTP_EXPIRES_SECONDS: z.coerce.number().int().positive().default(60),
+  PHONE_OTP_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
+  PHONE_OTP_LOCKOUT_MINUTES: z.coerce.number().int().positive().default(5),
+  PHONE_OTP_RESEND_COOLDOWN_SECONDS: z.coerce.number().int().positive().default(30),
+  // SMS gateway (PRD §12.2 "SMS/OTP Gateway (e.g. MSG91, Twilio)"). Optional in dev — falls
+  // back to console-logged OTPs.
+  MSG91_AUTH_KEY: z.string().optional(),
+  MSG91_SENDER_ID: z.string().optional(),
+  MSG91_OTP_TEMPLATE_ID: z.string().optional(),
+  // Temporary dev/test convenience (not in PRD/TRD): forces every phone OTP to a fixed
+  // '123456' and skips the real MSG91 SMS send entirely, so signup/login work with zero SMS
+  // gateway credentials during development. Hard-disabled outside development below regardless
+  // of this flag's value — comment out/remove MOCK_OTP from .env once MSG91 keys are set and
+  // real OTPs resume automatically.
+  MOCK_OTP: z
+    .string()
+    .optional()
+    .transform(v => v === 'true')
+    .default(false),
   CLOUDINARY_CLOUD_NAME: z.string().min(1),
   CLOUDINARY_API_KEY: z.string().min(1),
   CLOUDINARY_API_SECRET: z.string().min(1),
@@ -37,6 +65,17 @@ const envSchema = z.object({
   // consent versions) are DB-configurable via `ComplianceConfig`, not env vars — see
   // `complianceConfigService` — so an Admin can adjust them without a redeploy.
   RETENTION_SWEEP_INTERVAL_MINUTES: z.coerce.number().int().positive().default(60),
+  // v2.1 Beta Credits/Connects economy (PRD_TRD_SUMMARY.md §1, §10 item 7, backend Phase 2 item
+  // 4). Interim env-var gate for the Razorpay top-up/withdraw endpoints only — Phase 6 replaces
+  // this with the full `platform_settings`-backed Feature Flags surface. Defaults to `false`
+  // (Beta Mode is the v2.1 default launch mode); set to `true` to reach Public Launch behavior.
+  // Deliberately does NOT gate escrow/request creation, which remains INR-only/unconditional
+  // until Phase 2 item 5 (currency-aware escrow) lands — see docs/CLAUDE.md §2.1.
+  ENABLE_REAL_MONEY: z
+    .string()
+    .optional()
+    .transform(v => v === 'true')
+    .default(false),
 });
 
 // Production Configuration hardening (backend Phase 14): a handful of vars are optional in
@@ -48,6 +87,7 @@ const baseEnv = envSchema.parse(process.env);
 if (baseEnv.NODE_ENV === 'production') {
   const missing: string[] = [];
   if (!baseEnv.BREVO_API_KEY || !baseEnv.BREVO_SENDER_EMAIL) missing.push('BREVO_API_KEY/BREVO_SENDER_EMAIL');
+  if (!baseEnv.MSG91_AUTH_KEY || !baseEnv.MSG91_SENDER_ID) missing.push('MSG91_AUTH_KEY/MSG91_SENDER_ID');
   if (!baseEnv.RAZORPAY_WEBHOOK_SECRET) missing.push('RAZORPAY_WEBHOOK_SECRET');
   if (!baseEnv.FIREBASE_SERVICE_ACCOUNT_PATH) missing.push('FIREBASE_SERVICE_ACCOUNT_PATH');
   if (baseEnv.CORS_ORIGIN === '*') missing.push('CORS_ORIGIN (must not be "*" in production)');
@@ -61,4 +101,9 @@ if (baseEnv.NODE_ENV === 'production') {
   }
 }
 
-export const env = baseEnv;
+export const env = {
+  ...baseEnv,
+  // Hard safety net: MOCK_OTP never activates outside development, even if the flag is left
+  // set by mistake in a staging/production .env.
+  MOCK_OTP_ENABLED: baseEnv.MOCK_OTP && baseEnv.NODE_ENV === 'development',
+};

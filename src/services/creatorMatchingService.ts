@@ -26,14 +26,17 @@ export type RequestWithDistance = Request & {distanceMeters: number};
  */
 export const creatorMatchingService = {
   /**
-   * A request is visible to a creator when: PUBLISHED (not DRAFT/locked/terminal), not their
-   * own, and not expired. `CREATOR_ASSIGNED`+ requests are already locked to another creator
-   * and are intentionally excluded — this is the discovery-time half of the locking contract
-   * that Phase 3's Redis mutex (see `creatorLockService.ts`) will enforce at accept-time.
+   * A request is visible to a creator when: PUBLISHED or MATCHING_WINDOW (not DRAFT/locked/
+   * terminal), not their own, and not expired. MATCHING_WINDOW (backend Phase 4 item 4) is a
+   * Highest Rated request's own "searching" state — it must stay discoverable the same way
+   * PUBLISHED is, or nearby Creators could never see it to respond. `CREATOR_ASSIGNED`+ requests
+   * are already locked to another creator and are intentionally excluded — this is the
+   * discovery-time half of the locking contract that Phase 3's Redis mutex
+   * (`creatorLockService.ts`) enforces at accept-time.
    */
   isVisibleToCreator(request: Request, creatorId: string, now: Date = new Date()): boolean {
     return (
-      request.status === 'PUBLISHED' &&
+      (request.status === 'PUBLISHED' || request.status === 'MATCHING_WINDOW') &&
       request.requesterId !== creatorId &&
       request.expiresAt.getTime() > now.getTime()
     );

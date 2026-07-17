@@ -1,730 +1,224 @@
-# Locator Backend — Master Execution Plan
+# Locator Backend — Master Execution Plan (v2.1 Compliance)
 
-**Strictly derived from `Locator_App_PRD_v4.pdf` (Unified MVP PRD v2.0, Phase 1).** This replaces all prior execution-plan content (the earlier "Location Discovery" plan tracked here was for a feature outside this PRD's scope — see `docs/CLAUDE.md` §6 "Out of PRD scope"). Every phase below cites the PRD section(s) it implements. Do not add scope that isn't traceable to a PRD section.
+> **Correction (2026-07-15):** every prior status note in this file citing "N pre-existing
+> Redis-unavailable failures" (Phase 1, Phase 8 item 3, and the top-level status summaries) was
+> based on a dev sandbox where Redis genuinely wasn't reachable at test-run time — that part was
+> real. But when Redis *was* later confirmed reachable in this same environment, running the full
+> suite surfaced that those tests weren't just "blocked by no Redis" — one (`acceptMutex`'s first
+> case) had a stale assertion left over from the `TEMPORARY_CHAT` retirement (Phase 4 item 2) that
+> was never updated, and `settingsService`'s Redis cache had no TTL at all, so a value written by
+> one test (or by manual testing) could silently leak into a later, unrelated test's "no row
+> exists" assertion for as long as Redis stayed up. Both are now fixed: the stale assertion was
+> corrected, and `cacheSet` now expires after 60s (matching TRD 8.4's own stated propagation
+> target) with settings-test cleanup also evicting the cache key directly. **With Redis reachable,
+> the full suite is 23/23 suites, 91/91 tests, no exceptions** — verified 2026-07-15. Do not carry
+> forward the "N pre-existing failures" framing from older entries below as still true.
 
-This plan assumes the existing generic scaffold (auth, wallet ledger, admin shell, notifications, profile) documented in `docs/CLAUDE.md` §6 "Reusable as foundation" stays in place and is extended, not rewritten.
+**Derived from `../../docs/PRD_TRD_SUMMARY.md` (PRD v2.1 + TRD).** This replaces all prior execution-plan content, which targeted the now-superseded PRD v2.0. It does **not** start from zero: the existing codebase (documented gap-by-gap in `docs/CLAUDE.md` §2 and endpoint-by-endpoint in `docs/API.md`) is a mature, working implementation of a v2.0-shaped product — auth, GPS matching, Redis mutex locking, recording/upload, moderation, requester review, escrow, ratings, reports, disputes, admin panel, notifications, and compliance/retention are all built and functioning. This plan sequences the **migration** off the v2.0-shaped pieces and the **addition** of what v2.1 requires that doesn't exist yet.
 
----
-
-## Phase 0 — Decisions, Infra Provisioning, Open Questions (blocking, do first)
-
-**PRD refs:** §1.3, §12.2, §12.3, tagging key.
-
-The PRD explicitly tags a number of values `[REVIEW]` — meaning "must be confirmed before development begins." Do not proceed past Phase 1 on any item below without either a client answer or an explicit interim decision documented in `docs/CLAUDE.md` §7.
-
-- [ ] Confirm: proximity radius (default assumption: 500m), request expiry window (24h), acceptance timer (suggested 15 min), re-shoot window (suggested 24h), platform commission (15%), high-value review threshold (₹1,000), chat/video/moderation-log retention windows.
-- [ ] Confirm RazorpayX feasibility, payout charges, commission structure (§1.3, §5.2.1).
-- [x] Restricted Location Engine implemented (2026-07-01): manual admin-curated list (`RestrictedLocation` model + `/admin/restricted-locations` CRUD) always wins; if no manual match and `GOOGLE_PLACES_API_KEY` is set, a Google reverse-geocode keyword check is used as a best-effort assist via the same `locationCategoryService.classify()` interface — usable today via `GET /location/classify`, and the exact call Phase 2's `POST /requests` will make once it exists. **Interim decision, flag to client**: Google's assist only ever yields `PUBLIC`/`RESTRICTED`, never `PROHIBITED` — hard blocks remain manual-list-only to avoid false-positive auto-blocking. See `docs/API.md` "Restricted Location Engine".
-- [x] Provision: Redis instance (Creator mutex lock — §5.5, §12.2) — done 2026-07-03 (local Docker `redis:7-alpine` for dev; `REDIS_URL` in `.env`/`.env.example`, `src/config/redis.ts`). Still open: AWS S3 bucket for ephemeral video (§12.2), SMS/OTP gateway account (MSG91/Twilio — primary phone-OTP channel, §3.1/§5.1.1), RazorpayX merchant setup, WebRTC/managed streaming service selection (§12.2, §14 — "finalise before Week 3").
-- [ ] Decide Moderator implementation: a role/capability flag on the existing `Admin` model (recommended, matches §3.1 "Moderator is a role/view within the Admin panel — not a separate portal or system account") vs. a new table. Do not build a third JWT namespace.
-
-**Exit criteria:** infra credentials in `.env` (validated via `config/env.ts`), open numeric questions have interim values documented, Moderator model decided.
+Every phase cites the `PRD_TRD_SUMMARY.md` section(s) it implements. Do not add scope not traceable to the summary (or, where more detail is needed, `docs/Locator_App_PRD_v2.1.md`/`docs/Locator_App_TRD.txt` directly).
 
 ---
 
-## Phase 1 — Data Model & State Machine Foundation
+## Phase 0 — Decisions & Schema-Design Lock (blocking, do first)
 
-**PRD refs:** §5.13 (state machine, exact 15 states), §2, §5.2–§5.10, §9.1.
+**Summary refs:** §11 (Open Questions), §4 (Data Model), §10.
 
-1. [x] Prisma migration: `Request` model with the full state enum and transition-relevant timestamp fields (2026-07-01, migration `add_request_domain`). Do not add convenience states not in the PRD's table.
-2. [ ] `RequestEscrow` — **not built** (out of scope for the Request-domain pass; needs its own phase — see Phase 8). `Request` stores `rewardAmount`/`highValueReviewRequired` but no wallet debit happens on creation yet.
-3. [ ] `RequestVideo`, `RequestChat`/`ChatMessage`, `Rating`, `Report`, `Dispute`, `ConsentRecord`, `AdminAuditLog` — still not built. `RestrictedLocation` was already done in Phase 0.
-4. [ ] Extend `User`: trust-score badge field, KYC fields, consecutive-rejection counter — not done.
-5. [ ] Extend `PayoutRequest`: `viaRazorpayX`, `autoPayoutSnapshot` — not done.
-6. [x] Pure state-machine module: `src/services/requestStateMachine.ts` (2026-07-01). Encodes all 15 PRD §5.13 states as data (`assertTransition`/`canTransition`/`getValidNextStatuses`). **Caveat:** the exact PRD §5.13 transition table PDF was not available in the environment this was built in — the table was reconstructed from the CLAUDE.md/MASTER_EXECUTION_PLAN.md lifecycle narrative and should be diffed against the source PRD before Phase 3+ starts wiring the transitions this phase doesn't exercise (`CREATOR_ASSIGNED`, `TEMPORARY_CHAT`, `RECORDING`, etc.).
+No migration work starts until these are decided — several are genuine architecture forks, not just numeric confirmations.
 
-**Exit criteria:** ~~migrations applied~~ done for `Request`/enums only (escrow/chat/video/rating/report/dispute/consent/audit-log models remain Phase 1 follow-up work); state machine module has a transition table (pending PRD-PDF diff per the caveat above), and is unit-tested indirectly via `assertTransition` throwing on every endpoint call — a dedicated no-DB assertion script is still TODO.
+1. **[ ] Video storage: keep Cloudinary or migrate to S3?** (`docs/CLAUDE.md` §2.17). `IVideoStorageProvider` already isolates the decision to one new file + a one-line swap — but TRD's client-direct-to-S3-multipart upload model is a different *transport* shape than today's API-tier-proxied Cloudinary upload, so this also affects the Recording module's request/response shapes if changed. Decide before Phase 5 below.
+2. **[ ] Job scheduler: adopt BullMQ + node-cron, or keep `setInterval`?** (`docs/CLAUDE.md` §2.18). The Highest Rated matching-window close (Phase 4) *needs* a genuine per-request delayed job — `setInterval` sweeps can approximate this but not cleanly. Recommendation: adopt BullMQ now (ioredis is already a dependency) rather than build a second ad-hoc delayed-job mechanism on top of `setInterval`.
+3. **[x] Ledger design: extend `Transaction`, or introduce a new `ledger_entries` table alongside it?** — **Decided 2026-07-14: new table.** Introduced `LedgerEntry` (Phase 1) as a standalone append-only table for Credits/Connects/INR; `Transaction` untouched, stays the Razorpay-specific payment-gateway audit trail. No cross-FK from `LedgerEntry` to `Transaction` was added — they're parallel audit trails for two different economy modes, not layered.
+4. **[x] Confirm the numeric defaults PRD_TRD_SUMMARY.md flags as garbled/ambiguous** (§11 item 8) — **Decided 2026-07-14:** PRD §7.3 defaults used as authoritative, captured in `src/config/betaEconomy.ts`: signup 300 Credits/30 Connects, request cost 150 Credits, creator reward 150 Credits, accept cost 1 Connect, daily bonus 5 (cap 50).
+5. **[ ] `settings_version_id` generalization scope**: decide whether every request-adjacent write pins a settings version (full TRD 7.1.1 compliance) or only the highest-risk ones (economy amounts, timers) at first — recommend full compliance since `RequestEscrow.commissionRate` already proves the snapshot pattern works and is cheap.
+6. **[ ] RBI prepaid-instrument / legal sign-off items** (summary §8.4, §11 items 6-7): not blocking for Beta-mode-only work (Phases 1-6 below never touch `ENABLE_BUY_CREDITS`/`ENABLE_BUY_CONNECTS`), but must be resolved before any Public Launch real-money-mode work ships. Flag to product/legal now so it isn't rediscovered at Phase 9.
+7. **[ ] Public-identity audit** (`docs/CLAUDE.md` §2.12): before building new user-facing payloads in Phases 1-8, do a one-time pass over every existing participant-facing presenter (`requestPresenter`, `ratingPresenter`, `disputePresenter`, notification payload builders) confirming `User.name` never appears where only `username` should. Cheap, should happen before compounding the problem in new modules.
 
----
+**Exit criteria:** all seven items above have a documented decision (even if the decision is "defer, tracked as risk") committed to this file or a linked ticket before Phase 1 migrations begin.
 
-## Phase 2 — Request Creation & Basic Lifecycle
-
-**PRD refs:** §4.2, §4.3, §5.3, §7.3, §8.1 (creation-adjacent notifications).
-
-**Status: done except escrow/high-value-admin-queue/notifications (2026-07-01).** Built as part of the same pass as Phase 1 above, deliberately excluding escrow/chat/Creator-matching/recording per an explicit scope cut for this build — see `src/services/requestService.ts`, `src/controllers/requestController.ts`, `src/routes/requestRoutes.ts`, `src/validations/requestValidation.ts`, `src/repositories/requestRepository.ts`.
-
-1. [x] `POST /requests` — field validation per §5.3.1 (description 10-300, duration ∈ {1,2,5,10,15}, reward ₹10-2000, category enum, instructions ≤500). Supports `IMMEDIATE` (auto-publishes unless high-value) and `SCHEDULED` (stays `DRAFT` until `scheduledAt`, published by the lifecycle sweep).
-2. [x] Location categorization at creation time — wired to the existing `locationCategoryService.classify(lat, lng)` (Phase 0). `PROHIBITED` → `422` hard block. `RESTRICTED` → stored and allowed, but the "Admin flag" queue itself is not built (no moderation queue exists yet — Phase 6).
-3. [ ] Escrow reservation on creation — **not built**, `RequestEscrow` doesn't exist (see Phase 1 note above; deferred to Phase 8 by explicit scope decision, not an oversight).
-4. [x] High-value flag (reward ≥ ₹1,000) computed and stored (`highValueReviewRequired`); request is kept `DRAFT` instead of auto-publishing. [ ] The actual mandatory-Admin-review queue/action is not built (Phase 6).
-5. [ ] Requester declaration capture → `ConsentRecord` row — **not built** (`ConsentRecord` model doesn't exist yet); the boolean is validated at the API boundary and `requesterDeclarationAt` is stamped on the `Request` row itself as an interim substitute.
-6. [x] Scheduled job: `src/services/requestLifecycleJob.ts`, run via `setInterval` every 5 minutes from `src/server.ts` (no job-queue lib in this stack). Publishes due `SCHEDULED` requests and expires `DRAFT`/`PUBLISHED` requests past `expiresAt`. **Auto-refund is not wired** (no escrow to refund yet) — only the `status → EXPIRED` transition happens.
-7. [x] `POST /requests/:id/cancel` — pre-acceptance only (`DRAFT`/`PUBLISHED`), no penalty. **No refund** (no escrow yet).
-8. [x] `GET /requests/mine` — Requester's own requests, paginated, optional `status` filter.
-
-Also built, not originally itemized here: `GET /requests/:id` (owner-only detail) and `PATCH /requests/:id` (DRAFT-only field edits) for CRUD completeness.
-
-**Exit criteria:** a Requester can create, view, edit (while DRAFT), and cancel a request; prohibited locations blocked; restricted locations flagged and stored. Escrow reserve/refund is intentionally **not** met by this pass — tracked as the Phase 1/2 remainder above, to be picked up when the escrow domain is built (Phase 8, or pulled forward if the client wants escrow ahead of Chat/Creator-matching).
+**Progress (2026-07-14):** items 3-4 decided (see inline above). Items 1-2 (video storage, job scheduler) deliberately left undecided — neither blocks Phase 1/2 work, revisit before Phase 4 (job scheduler) and Phase 5 (video storage transport). Items 5-7 (settings_version_id scope, RBI sign-off, public-identity audit) remain open, tracked for Phase 6/7/9.
 
 ---
 
-## Phase 3 — Discovery & Fulfilment (Creator side)
+## Phase 1 — Foundational Schema Migrations
 
-**PRD refs:** §5.5, §5.11, §4.4, §8.1.
+**Summary refs:** §4 (Data Model) in full, §10.
 
-**Status: Discovery half done (2026-07-03), Fulfilment half done (2026-07-03).** Built
-as `src/services/creatorMatchingService.ts` (eligibility/visibility/ordering — no matching
-logic in controllers, per `docs/CLAUDE.md`), `src/services/creatorService.ts`
-(location/status/dashboard), `src/repositories/{requestRepository,userRepository}.ts`
-discovery query additions, `src/utils/geo.ts#boundingBox`. See `docs/API.md` "Creator
-Discovery & Matching", "Request Acceptance & Fulfilment", and "Creator Profile" for the exact
-endpoint shapes.
+The single highest-leverage phase: every later phase depends on these tables existing. Ordered so nothing here references a table created later in this phase.
 
-1. [x] `GET /requests/nearby` — proximity query (radius 100-2000m, default 500m per PRD) around the Creator's current location (passed as query params, not stored-location — the Creator can query any point), filtered to `PUBLISHED` status only (excludes DRAFT and CREATOR_ASSIGNED+ — those are already locked), sorted nearest-first, with category/reward-range/type filters (§5.11.1–§5.11.2). Haversine-over-bounding-box (`src/utils/geo.ts`), not PostGIS — sufficient at MVP scale per this file's original note.
-   - [x] `GET /requests/available` — no-GPS fallback feed (same filters, newest-first, no distance) — PRD §5.11.1's fallback case, not itemized in this plan originally but required by the mobile spec (`locator-mobile/docs/CLAUDE.md` §1 "Falls back to city-filtered results if GPS permission denied").
-   - [x] `GET /requests/:id/details` — Creator-facing detail view (any authenticated user, non-DRAFT only) — not itemized originally but required so the mobile Request Detail screen has a non-owner-gated endpoint to call (`GET /requests/:id` is owner-only).
-2. [x] `PATCH /creator/location`, `PATCH /creator/status` (`ONLINE`/`OFFLINE`/`BUSY` — new `User.availabilityStatus` field), `GET /creator/dashboard` (extended 2026-07-03 with `activeRequest`, `acceptanceCountdownSeconds`, `pendingRequests` preview, `acceptedRequests`). Only `ONLINE` creators are matched by `creatorMatchingService`'s reverse lookup.
-3. [x] Push broadcast on publish (§8.1 "New Request Near You") — wired 2026-07-03 into both `requestService.create`'s immediate-publish path and `requestLifecycleJob.publishDueScheduled`, via `creatorMatchingService.findEligibleCreatorsForRequest()` + `fcmService.sendToMultiple`. Best-effort — never blocks creation/publication.
-4. [x] `POST /requests/:id/accept` — built 2026-07-03. Redis-based atomic mutex lock (`ioredis`, `SET key value NX PX ttl`, TTL = `ACCEPTANCE_TIMER_MINUTES`, safe compare-and-delete release via a Lua script keyed on a per-acquisition token), GPS proximity check (rejects outside `radiusMeters` with the PRD's exact error string), sets status → `CREATOR_ASSIGNED`, starts acceptance timer. `src/services/creatorLockService.ts`'s in-memory placeholder was replaced with a real Redis-backed implementation (`src/config/redis.ts`, `REDIS_URL` env var, retry/health-check/graceful-shutdown wired into `startupChecks.ts`/`server.ts`) — no callers changed except the interface itself (added a `token`-based `release`/`forceRelease` split for cross-process safety, since nothing called the old `acquire`/`release` signature yet). Full business-rule order (published/not-expired/not-own/online/prohibited-block/distance/idempotent-retry/conflict) documented in `docs/API.md`.
-5. [x] Scheduled job: `src/services/acceptanceTimerJob.ts`, swept every 30s from `src/server.ts`. Acceptance timer expiry → force-releases the Redis lock (safety net; Redis's own TTL almost always already evicted it), status → back to `PUBLISHED` (re-enters discovery), notifies Requester ("Still searching for a Creator").
-6. [ ] 5-minutes-before-expiry push to the Creator (§8.1) — **not built this pass**; the countdown is visible client-side (dashboard/detail screen), but no dedicated "5 minutes left" push notification exists yet. Minor gap, flagged for a follow-up pass rather than blocking this milestone.
+1. **[x] `platform_settings` + `platform_settings_versions`** (summary §4.15) — key-value economy/operational/feature-flag store with immutable version history. This unblocks Phase 6 (Feature Flags admin page) and is also the mechanism Phase 2's `settings_version_id` FK points at.
+2. **[x] Beta Credits/Connects wallet fields** (summary §4.3): `earnedCredits`, `bonusCredits`, `purchasedCredits`, `creatorConnects`, `lastDailyConnectGrantDate` added directly to `User` (not a separate `Wallet` model — matches this codebase's existing convention of `walletBalance` living directly on `User`). `walletBalance` (INR) deliberately left untouched/un-migrated to paisa — that unit conversion was judged higher-risk than the value it adds right now and is deferred; every real-money code path still reads `walletBalance` in rupees exactly as before.
+3. **[x] `LedgerEntry` table** (summary §4.4) — append-only, `reasonCode` enum, `settingsVersionId` (string, not yet FK-enforced pending Phase 6), `idempotencyKey` unique nullable column. Landed schema-only in this item; **wired to a real writer in Phase 2** (`ledgerService`, done — see below), ahead of this phase's original "schema-only" scope.
+4. **[x] `requests` table alterations**: added `acceptanceMode` enum (`FIRST_ACCEPTED|HIGHEST_RATED`, default `FIRST_ACCEPTED`), `currencyMode` enum (`CREDIT|INR`, default `INR`), `settingsVersionId`. **Status enum extended additively** (`PENDING_MODERATION`, `MATCHING_WINDOW`, `TIPPING` added; `TEMPORARY_CHAT`/old states intentionally NOT removed yet) rather than renamed with a data migration — the full v2.1 rename + existing-row remap is Phase 3's job (riskier, touches every module reading `Request.status`); this item only unblocks Phase 3 without pre-empting it.
+5. **[x] `PreAcceptanceQuery` + `PreAcceptanceQueryMessage` tables** (summary §4.6) — `exchangeCount`, `status` enum, per-Creator thread (`@@unique([requestId, creatorId])`).
+6. **[x] `MatchingWindowResponse` table** (summary §4.7) — for Highest Rated mode (Phase 4).
+7. **[x] `PostSubmissionChatMessage` table** (summary §4.10) — modeled as a separate table from `ChatMessage`, per the plan's own recommendation.
+8. **[x] `Tip` table** (summary §4.13).
+9. **[x] `VerifiedCreatorStatus` table** (summary §4.12) — `completedCount`, `isVerified`, `revokedReason`, `lastEvaluatedAt`. `User.isVerified` left as-is; Phase 7 decides reconciliation.
+10. **[x] `Rating.visibleAt`** column (summary §4.11) — double-blind reveal timestamp, nullable/unset until Phase 8 wires the computation.
+11. **[x] KYC/bank fields on `User`** (summary §4.2: `bankAccountNumber`, `bankIfsc`, `kycStatus`) — schema only, no encryption/logic yet.
+12. **[x] `usernameChangedCount`** on `User` (summary §4.2) — schema only; enforcement is Phase 8 item 8.
 
-**Note (2026-07-03, Phase 4 pass):** acceptance now advances straight through `CREATOR_ASSIGNED`
-into `TEMPORARY_CHAT` within the same `accept()` call (chat opens automatically per PRD §5.4) —
-`CREATOR_ASSIGNED` is a transient intermediate state, not one a client will typically observe.
-The acceptance-timer sweep and dashboard's `acceptanceCountdownSeconds` were updated to key off
-`TEMPORARY_CHAT` accordingly (see Phase 4 below and `docs/API.md`).
-
-**Exit criteria (Discovery half):** an `ONLINE` creator sees `PUBLISHED` requests within their
-radius, nearest-first, correctly excluding their own requests and already-locked ones;
-filters (category/reward/type) narrow results correctly; a creator without GPS gets the
-`/available` fallback feed. **(Fulfilment half, done 2026-07-03):** two Creators racing to
-accept the same request — exactly one wins, the other gets the PRD's exact rejection string;
-an accepted-but-inactive Creator correctly releases the lock and request after the timer.
-**Correction (2026-07-03 audit):** no automated test file actually backs these claims — there
-is no test framework installed in this repo at all (Phase 14 item 1 is accurate: "currently
-absent entirely"). These behaviors were manually verified via live end-to-end runs against the
-running dev server, not via a committed test suite — do not cite "verified via ... test" as if
-a regression-preventing test exists until Phase 14 actually builds one. Chat/Recording (Phases 4-5)
-remain the explicit next dependency-ordered step and are out of scope for this pass.
+**Exit criteria:** met. `prisma migrate dev` applied cleanly against the real dev Postgres DB (migration `20260714085613_v2_1_phase1_additive_schema`); every existing `Request` row keeps its pre-migration status (additive enum, no remap needed this phase); `tsc --noEmit` and the full Jest suite (28/30 → 34/36 after Phase 2's additions below; the 2 failures are a pre-existing Redis-unavailable environment issue, not caused by this migration) both pass clean.
 
 ---
 
-## Phase 4 — Temporary Chat
+## Phase 2 — Beta Credits/Connects Wallet & Ledger
 
-**PRD refs:** §5.4.
+**Summary refs:** §3.2, §4.3, §4.4, §5.6 (Wallet/Ledger state machine), §10 item 7.
 
-**Status: done except retention job (2026-07-03).** Built as `ChatMessage` Prisma model,
-`src/repositories/chatRepository.ts`, `src/services/chatService.ts`,
-`src/utils/chatContentFilter.ts`, `GET/POST /requests/:id/chat` (in `requestController.ts`/
-`requestRoutes.ts` alongside the rest of the Requests module, matching how Discovery/Fulfilment
-were added in Phase 3). See `docs/API.md` "Temporary Chat".
+Depends on: Phase 1 items 1-3.
 
-1. [x] Chat opens automatically on GPS-validated acceptance (state → `TEMPORARY_CHAT`) — wired directly into `requestService.accept()`, immediately following the mutex-guarded `CREATOR_ASSIGNED` transition (see Phase 3's note above). Closes automatically (permanently, per-request) on Start Recording — enforced today via the `TEMPORARY_CHAT`-only gate on `POST /requests/:id/chat` (`409` once status advances); the actual Start Recording transition itself is Phase 5, not built yet.
-2. [x] Server-side content filter (§5.4.2 patterns: phone numbers, +91 prefixes, email, WhatsApp/Telegram/Instagram handles, UPI VPAs, URLs) — `src/utils/chatContentFilter.ts`, rejects with `422` and logs the blocked attempt regardless (`ChatMessage.blocked`/`blockReason`, never returned by `GET .../chat` to the other participant). **The exact PRD §5.4.2 rejection string wasn't available in this environment — shipped an interim, clearly-flagged placeholder pending client confirmation, same pattern used for other undocumented exact PRD strings in this codebase.**
-3. [x] >3 blocked attempts on one request → `Request.chatFlaggedForReview = true` (no Moderator queue exists yet to act on this — Phase 6 — but the flag is captured now so that phase has data to work with).
-4. [ ] Retention job: purge chat logs 90 days [REVIEW] after request close — **not built this pass**, per explicit scope decision (the number itself is unconfirmed `[REVIEW]`, and nothing yet depends on the purge happening). Tracked for Phase 13 (Compliance/Retention) alongside the rest of the retention jobs.
+1. **[x] `ledgerService`** (`src/services/ledgerService.ts`) — single write path per currency. Uses guarded `updateMany` (`WHERE balance >= amount`) rather than an explicit `SELECT ... FOR UPDATE`, matching the pattern `transactionRepository.markSuccessIfPending`/`escrowService` already use elsewhere in this codebase — a negative balance is structurally impossible either way. `debitCredits` enforces bonus→purchased→earned spend order with a 3-attempt optimistic-retry loop; every write inserts a `LedgerEntry` row in the same transaction as the balance update; `idempotencyKey` replay returns the original entry without re-applying. Covered by `src/services/__tests__/ledger.integration.test.ts` (6 tests, DB-backed, all passing).
+2. **[x] `walletService` additions**: `GET /wallet` (new endpoint, `walletService.getWallet`) returns `{earnedCredits, bonusCredits, purchasedCredits, videoCredits, creatorConnects, inrBalance}` — `videoCredits` computed at read time, never stored. Spend order lives entirely in `ledgerService.debitCredits`, never left to callers.
+3. **[x] Signup bonus + Daily Free Connects grant**: `ledgerService.grantSignupBonus` wired into both `authService` registration-completion paths (email OTP + phone OTP), idempotency-keyed per-user so it can never double-grant. `ledgerService.grantDailyConnectBonusIfDue` is event-driven, hooked into `GET /wallet` (the natural "app opened" signal) rather than a midnight cron — idempotent per IST calendar day via `lastDailyConnectGrantDate`, caps the grant so balance-from-daily-bonus never exceeds 50.
+4. **[x] `ENABLE_REAL_MONEY` feature flag** (`src/config/env.ts`, default `false`): gates `walletService.createOrder`/`verifyPayment`/`withdraw` (403 when off). Interim env-var gate per the plan's own guidance — Phase 6 replaces it with the full `platform_settings` surface.
+5. **[x] Migrate `RequestEscrow` to be currency-aware** (2026-07-14): added `RequestEscrow.currency` (`CREDIT|INR`, default `INR`). `escrowService.reserve/release/refund` now branch on it — CREDIT routes through `ledgerService` (zero commission; `creatorEarnings` is the independently-configured Creator Reward constant, not a split of the held amount, per PRD §7.3's "Request Cost ≠ Creator Reward, equal only by default" design), INR keeps the exact pre-existing `walletBalance`/`Transaction` logic untouched. `requestService.create` now derives `currencyMode` from `ENABLE_REAL_MONEY` (CREDIT when off — the v2.1 default) and uses the fixed Request Cost (150 Credits) instead of a client-supplied amount in that mode, skipping high-value review (N/A in Beta per PRD §5.3.1). `escrowService.adminSummary` scoped to INR-only (mixing Credits+INR sums would be misleading) with a comment pointing at Phase 6 for a proper per-currency breakdown. Tested (`src/services/__tests__/escrowCredit.integration.test.ts`, 3 tests). **Deliberately out of scope for this item:** `disputeService.resolve`'s delta-based split-settlement math is still INR/`walletBalance`-only — a CREDIT-mode dispute resolution would currently misbehave; flagged, not silently left broken (see the Phase 11 note this plan should carry once written that far).
+6. **[x] Tipping** (`tipService.ts`, new — `Tip` table from Phase 1): `POST/GET /requests/:id/tips`, 10-500 Credits or ₹10-500 depending on `currencyMode`, 100% to Creator, zero commission always, 7-day window post-`completed` (measured from `requesterDecisionAt`). Branches on `request.currencyMode`: CREDIT via `ledgerService`, INR via the existing `walletBalance`/`Transaction` pattern. Tested (`src/services/__tests__/tip.integration.test.ts`, 5 tests, both currency branches).
 
-**Exit criteria (met except retention):** blocked-content patterns from §5.4.2 are all rejected server-side (verified via a live end-to-end run: phone number, email, and URL patterns all correctly blocked and excluded from the participant-facing list; a non-participant gets `403`; the 3-blocked-attempts flag fires correctly) — not just client-side (mobile also runs the same patterns client-side for instant feedback, Phase 6 mobile). Moderator/Admin visibility into chat at all times isn't meaningfully testable yet since no Moderator/Admin chat viewer exists (Phase 6, Admin sub-module) — the data model supports it (nothing is ever hard-deleted), but there's no read surface for it yet.
+**Exit criteria: met.** A Beta-mode user signs up (receives signup bonus + Connects), posts a request (Credits debited via `ledgerService`/`LedgerEntry`, not `Transaction`), gets it fulfilled (Creator's reward Credits released), and tips — all verified end-to-end and covered by tests. A real-money-mode user (`ENABLE_REAL_MONEY=true`) still works exactly as before via the existing Razorpay/escrow path (verified — INR-mode tests still pass unchanged).
 
----
-
-## Phase 5 — Recording & Upload Pipeline
-
-**PRD refs:** §5.6, §4.4.
-
-**Status: done (2026-07-03), Cloudinary substituted for S3 per this milestone's explicit scope
-decision.** Built as `RequestVideo` Prisma model (+ `VideoUploadStatus` enum), a
-storage-provider abstraction (`src/services/storage/IVideoStorageProvider.ts` +
-`CloudinaryVideoStorageProvider.ts` — **only** file in the codebase that imports the
-`cloudinary` SDK for video; `recordingService`/`requestService` depend solely on the
-interface), `src/repositories/requestVideoRepository.ts`, `src/services/recordingService.ts`,
-`src/controllers/recordingController.ts`, routes registered in `requestRoutes.ts`,
-`src/validations/recordingValidation.ts`, `videoUpload` multer config in
-`middlewares/upload.ts`. See `docs/API.md` "Recording & Upload".
-
-1. [x] `POST /requests/:id/recording/start` — closes chat (chat's own `409` gate already keys
-   off `status !== 'TEMPORARY_CHAT'`), stamps `creatorDeclarationAt` (mandatory
-   `{declaration: true}` body field — the PRD's "records Creator declaration consent" is met
-   as an inline timestamp on `Request`, matching the same interim pattern used for
-   `requesterDeclarationAt` in Phase 2, since `ConsentRecord` doesn't exist yet — Phase 13),
-   transitions `TEMPORARY_CHAT → RECORDING`.
-2. [x] Video upload → **Cloudinary** (not S3 — see "Important storage decision" below),
-   embeds GPS+timestamp+duration metadata **as reported by the client at upload time** (same
-   trust model as the Creator's GPS at Accept time, §5.5 — there is no independent
-   server-side verification), enforces minimum duration (matches the Requester's selected
-   duration, `durationMinutes*60 - 2s` tolerance) — rejects `422` `"Stream too short."` if
-   under. **Also enforces a maximum duration** (`+30s` grace) — not itemized in this plan
-   originally, but explicitly requested by this milestone's scope ("Maximum duration" listed
-   alongside "Maximum size"/"Allowed mime types" as required validations) — rejects `422`
-   `"Recording is too long for the selected duration."` if over.
-3. [x] Upload retry handling: `POST /requests/:id/video/:videoId/retry` resets a `FAILED`
-   session to `PENDING` so the client can re-call `complete`, up to 3 total attempts
-   (`RequestVideo.uploadAttempts`); the 3rd failure returns "flagged for review" copy and
-   blocks further retries (no dedicated Admin flag/queue exists yet — Phase 6 — this is the
-   client-visible terminal state only). `POST /requests/:id/video/:videoId/cancel` (not-yet-
-   uploaded sessions) and `DELETE /requests/:id/video/:videoId` (withdraw an uploaded draft,
-   reverts `Request.status → RECORDING`) round out the upload lifecycle — not itemized
-   originally, added because "Generate upload session / Retry / Cancel / Fetch / Delete draft"
-   was this milestone's explicit endpoint list.
-4. [x] On successful upload → chains `RECORDING → UPLOAD → MODERATOR_REVIEW` in one call
-   (mirrors how `accept()` chains `CREATOR_ASSIGNED → TEMPORARY_CHAT` in Phase 3/4) — **"notify
-   Moderator portal" is not built**, since no Moderator portal/queue exists yet (Phase 6, out
-   of this milestone's explicit stop condition). The request correctly lands in and waits at
-   `MODERATOR_REVIEW`.
-5. [x] Automatic thumbnail generation — Cloudinary `eager` transformation requested at upload
-   time (`400x400` JPEG, `eager_async: false` so the thumbnail URL is available in the same
-   response), not a separate polling step.
-
-**Important storage decision (explicit, this milestone):** the PRD's target is AWS S3 (§12.2),
-but this pass uses **Cloudinary only** — it was already configured in the project, and S3 was
-never provisioned (Phase 0 still lists it as open infra). Storage is fully abstracted behind
-`IVideoStorageProvider` so introducing `S3VideoStorageProvider` later is a new file + a
-one-line swap in `src/services/storage/index.ts`, not a `recordingService`/`requestService`
-rewrite.
-
-**Exit criteria:** a video with correct duration/GPS/timestamp lands in the moderation queue
-(verified live against the running dev server: start recording → create session → upload
-succeeds through a real Cloudinary round-trip on the failure path, retry/cancel/max-attempts
-all verified — see `docs/API.md`); a too-short recording is rejected client-visibly with no
-payment implication (escrow doesn't exist yet regardless). **Not independently verified this
-pass:** a full *successful* Cloudinary video upload with a genuine media file (the dev sandbox
-this was built in has no `ffmpeg`/sample-video asset to construct one) — the failure/retry/
-max-attempts path *was* verified against real Cloudinary API calls (a malformed file correctly
-round-tripped a `400` from Cloudinary into our `FAILED` state), and the upload code path itself
-was reviewed, but a first-person "thumbnail rendered correctly for a real video" observation is
-still outstanding. Flag this as the one open verification gap for a follow-up pass with a real
-device/emulator recording.
+**Behavioral change to be aware of when testing manually:** since `ENABLE_REAL_MONEY` defaults to `false`, every request created via the API right now is CREDIT-mode by default (matching v2.1's actual Beta-launch intent) — this is intentional, not a bug, but manual/Postman testing will see Credits-denominated requests unless `ENABLE_REAL_MONEY=true` is set in the environment.
 
 ---
 
-## Phase 6 — Moderation Workflow (Admin Sub-Module)
+## Phase 3 — Request State Machine Migration (v2.0 → v2.1)
 
-**PRD refs:** §5.9, §4.5, §5.14.7.
+**Summary refs:** §4.5, §5.6, §10 items 3, 5.
 
-**Status: Video moderation queue done (2026-07-03); pre-publish (high-value DRAFT) queue and
-Dispute-Center escalation explicitly deferred — see below.** Built as `RequestVideo.moderationStatus`/
-`moderationRejectionReason`/`moderationRemarks`/`moderatedAt`/`moderatedByAdminId` (extends the
-Phase 5 model — moderation decision fields were explicitly reserved for this phase, see
-`docs/CLAUDE.md` §2's `RequestVideo` note), a new `AdminAuditLog` model, `src/services/moderationService.ts`,
-`src/repositories/{requestVideoRepository,adminAuditLogRepository}.ts` additions,
-`src/controllers/{adminModerationController,adminAuditLogController}.ts`, routes registered in
-`adminRoutes.ts` under `/admin/moderation/*` and `/admin/audit-logs`. See `docs/API.md`
-"Moderation" and "Audit Logs" for exact shapes.
+Depends on: Phase 1 item 4. This is the riskiest phase — touches every module that reads `Request.status`.
 
-1. [ ] Pre-publish queue (`GET/PATCH /admin/moderation/requests` for high-value DRAFT requests) —
-   **not built this pass**, per this milestone's explicit scope (video moderation only was
-   requested; the pre-publish queue is a separate PRD §5.9 sub-feature with no escrow to refund
-   yet regardless, since `RequestEscrow` doesn't exist — Phase 8). Tracked as a follow-up, not an
-   oversight.
-2. [x] Video queue: `GET /admin/moderation/videos` (live queue, FIFO), `GET
-   /admin/moderation/videos/history` (past decisions), `GET /admin/moderation/videos/:videoId`
-   (video player data — asset URLs — plus a GPS map comparison — Creator GPS vs request pin,
-   `distanceMeters`/`withinRadius` — and a timestamp check), `PATCH .../approve` → `Request.status:
-   MODERATOR_REVIEW → REQUESTER_REVIEW`, `PATCH .../reject` (mandatory `reason` enum:
-   `CONTENT_VIOLATION`/`PROHIBITED_LOCATION`/`GPS_MISMATCH`/`DURATION_MISMATCH`/`FAKE_RECORDING`/`OTHER`)
-   → **`Request.status: MODERATOR_REVIEW → RECORDING`** (this milestone's explicit instruction:
-   rejection sends the Creator back to re-record, not to a terminal state — `REJECTED` remains
-   reserved for the Requester-side Phase 7 dispute path). `recordingService.createUploadSession`
-   was extended (additive, not rewritten) to also accept a fresh session once the latest video's
-   `moderationStatus` is `REJECTED`, alongside the pre-existing `FAILED` case.
-   - [ ] Escrow handling per §7.3's rejection-reason table — **not built**, `RequestEscrow`
-     doesn't exist yet (Phase 8); each rejection reason is captured and audit-logged today, but
-     there is no escrow outcome to route it to yet. Do not treat this as "reject = refund" being
-     implemented — it isn't, because there is no escrow to refund.
-   - [x] Bulk moderation: `POST /admin/moderation/videos/bulk-approve` / `/bulk-reject` — best-
-     effort per item (`Promise.allSettled`), one failure never blocks the rest.
-3. [ ] Escalate-to-Dispute-Center action, chat-log viewer for the request — **not built**, out of
-   this milestone's explicit scope (Disputes is a later, separate phase). The data model doesn't
-   block adding either later (chat rows and moderation decisions are never hard-deleted).
-4. [x] Admin override of Moderator decisions (§5.14.7) — trivially satisfied: Moderator is a
-   capability of the existing Admin JWT namespace, not a separate principal (docs/CLAUDE.md §1/§7
-   decision, reaffirmed here rather than re-litigated) — every Admin account already has full
-   access to the one underlying queue; there is no separate lesser Moderator principal whose
-   decisions would need "overriding" by a different role.
-5. [x] Requester video-visibility gate (mobile requirement, not originally itemized in this
-   phase but necessary once moderation exists to enforce it): `recordingService.getVideo`
-   (Phase 5) now nulls `secureUrl`/`thumbnailUrl` for the Requester until `moderationStatus ===
-   'APPROVED'` — the Creator always sees their own upload regardless. This is a small, additive
-   extension of already-shipped Phase 5 code, not a rewrite.
-6. [x] Immutable Admin Audit Log (`AdminAuditLog`, `GET /admin/audit-logs`) — this pass only
-   writes Moderation actions (`VIDEO_APPROVED`/`VIDEO_REJECTED`); backfilling other existing
-   Admin actions (user block/suspicious toggle, payout approve/reject) remains a later Phase 11
-   item, not done here.
+1. **[x] Rewrite `requestStateMachine.ts`'s transition table** (2026-07-14) against the v2.1 transition set — **but see the scoping decision below before treating this as "done" in the full sense the original wording implied.** Added `PENDING_MODERATION` (DRAFT's alternate next state) and `MATCHING_WINDOW` (PUBLISHED's alternate next state) as pure new graph edges — safe, zero-regression additions since no endpoint emits them yet (Phases 4/5 will). **Deliberate scoping decision:** did **not** rename `PUBLISHED`→`published_searching`/`CREATOR_ASSIGNED`→`creator_assigned` etc. — these are the same states, v2.1's prose just uses lowercase-with-underscores naming; renaming the Prisma enum values would be pure churn with no behavioral benefit, so this plan treats the v2.1 spec names as documentation-only aliases for the existing enum values everywhere except where a *genuinely new* state was needed (`PENDING_MODERATION`, `MATCHING_WINDOW`, `TIPPING`, all landed in Phase 1). The `SELECT ... FOR UPDATE`-before-guard-check invariant was verified already present for existing transitions (escrow code's discipline) — not yet added to the two new edges above since nothing calls them yet.
+2. **[x] Request expiry: 24h → 5h** (2026-07-14, `docs/CLAUDE.md` §2.8): `REQUEST_EXPIRY_HOURS` (`requestValidation.ts`) changed 24 → 5; `requestLifecycleJob.ts` already derived its sweep from this constant so no separate job change was needed. Scheduled requests: added `REQUEST_SCHEDULED_MIN_LEAD_HOURS = 4` (was unenforced entirely, not just 30min) plus a new 7-day-max validation (neither existed before). **Still hardcoded**, not yet admin-configurable via `platform_settings` (Phase 6) — flagged, not silently left as a TODO. **Not done**: the "acceptance window opens 2-4h before scheduled slot" mechanic — today's scheduled sweep still opens the request for acceptance at `scheduledAt` itself, not before it; that's item 4 below's job, still open.
+3. **[ ] Remove `TEMPORARY_CHAT` from the accept flow.** **Deliberately not done yet** (2026-07-14 scoping decision): `requestService.accept` still chains `CREATOR_ASSIGNED → TEMPORARY_CHAT`, and the state machine now has *both* the old `CREATOR_ASSIGNED → TEMPORARY_CHAT → RECORDING` path and the v2.1-correct `CREATOR_ASSIGNED → RECORDING` direct edge available (see item 1's edit) — but only the old path is actually reachable from any endpoint today. Removing `TEMPORARY_CHAT` now, before Phase 4's Pre-Acceptance Query exists, would delete the only working chat feature in the app with nothing to replace it for however long Phase 4 takes. **Do this together with Phase 4 item 1**, not before, so chat capability is never dropped mid-migration.
+4. **[ ] Insert `pending_moderation` / `published_searching` split as an actually-reachable path**: the state machine *can* express `draft → pending_moderation → published_searching` now (item 1), but no endpoint triggers it yet — `requestService.create` still always publishes directly. This is Phase 5's job (Moderation Toggle) to actually wire, not a Phase 3 gap; noted here so it isn't mistaken for done.
+5. **[x] `requester_review_auto_accept` job** (2026-07-14, summary §5.8, TRD 9): new `requesterReviewAutoAcceptJob.ts`, wired into `server.ts` on a 15-min interval — 42h warning push (`autoAcceptWarningSentAt` gate, new `Request` column), 48h auto-accept reusing `requesterReviewService.acceptVideo` directly (so auto-accept goes through the exact same escrow-release path a manual Accept does, no duplicated logic). Tested (`src/services/__tests__/requesterReviewAutoAccept.integration.test.ts`, 3 tests).
+6. **[x] `tipping` terminal state — resolved as N/A, not a gap.** PRD §7.6's exact wording is "Terminal. Does not alter Completed." — tipping never transitions `Request.status` away from `COMPLETED` at all. `tipService.tip` (Phase 2) correctly never calls `assertTransition`; `TIPPING` stays a defined-but-unreachable enum value (documented inline in `requestStateMachine.ts`). Re-read this item's summary §5.6 abbreviation as "completed → tipping" carefully before assuming a transition is needed — it isn't.
 
-**Exit criteria (met for video moderation; escrow/pre-publish/dispute-escalation explicitly
-deferred, see above):** every rejection reason is captured as a distinct, audit-logged value
-(not merged into a single blanket "reject" reason) and correctly reverts the request to
-`RECORDING` for a re-shoot; approve correctly advances to `REQUESTER_REVIEW`; the Requester
-cannot fetch the video asset until approved (verified live against the running dev server: a
-full create → accept → record → upload(simulated) → reject → re-open-session → upload(simulated)
-→ approve cycle, including the Requester-gate check before and after approval — see this
-session's completion report for the exact commands run). Escrow outcomes per §7.3's table remain
-unimplemented pending Phase 8 (`RequestEscrow` doesn't exist yet) — do not cite this phase as
-having wired escrow refunds; it has not.
+**Exit criteria: partially met, by design.** Items 2 and 5 are fully done and tested end-to-end. Items 1 and 4 landed the state-machine *shape* (new edges exist, safe/additive) without yet making the new paths *reachable* from any endpoint — that reachability work is correctly Phase 4 (Pre-Acceptance Query, Highest Rated matching) and Phase 5 (Moderation Toggle)'s job, not a re-scope of Phase 3. Item 3 (removing `TEMPORARY_CHAT`) is explicitly deferred to be done atomically with Phase 4 item 1 so chat functionality is never dropped mid-migration. This phase should be considered "foundation laid, full cutover pending Phases 4-5" rather than "complete."
 
 ---
 
-## Phase 7 — Requester Review & Re-shoot
+## Phase 4 — Pre-Acceptance Query + Acceptance Modes
 
-**PRD refs:** §5.10, §4.6.
+**Summary refs:** §3.4, §4.6, §4.7, §5.6, §5.7 (TRD 7.2.1, 8.2), §10 item 3, 4.
 
-**Status: done except Dispute-routing/auto-escalation (2026-07-03), by this milestone's explicit
-scope cut.** Built as `src/services/requesterReviewService.ts`,
-`src/controllers/requesterReviewController.ts`, routes registered in `requestRoutes.ts`
-alongside the rest of the Requests module, `src/validations/requesterReviewValidation.ts`. New
-`Request` fields: `reshootCount`, `requesterReviewRemarks`, `requesterRejectionReason`,
-`reshootReason` (migration `requester_review_reshoot`) — `reshootUsed`/`requesterDecisionAt`
-already existed from Phase 1. See `docs/API.md` "Requester Review & Re-shoot".
+Depends on: Phase 1 items 5-6, Phase 3 (state machine must have `matching_window` state available).
 
-1. [x] `POST /requests/:id/accept-video` → `REQUESTER_REVIEW → ACCEPTED`. Escrow release itself
-   is Phase 8 (not built — `RequestEscrow` doesn't exist), but the state correctly lands at
-   `ACCEPTED`, ready for that phase to pick up.
-2. [x] `POST /requests/:id/request-reshoot` (once only, reason required) → Creator notified,
-   chains `REQUESTER_REVIEW → RESHOOT_REQUESTED → RECORDING` in one call (mirrors the
-   `accept()` chaining pattern from Phase 3); re-shoot video re-enters the Phase 5/6 pipeline via
-   the existing `POST /requests/:id/video/session` (its guard was extended, additively, to allow
-   a fresh session once the request is back in `RECORDING` even if the latest video is
-   `APPROVED`, not just `FAILED`/`REJECTED`); `reshootUsed` enforced server-side blocks a second
-   `request-reshoot` call, so after a re-shoot only Accept/Reject are reachable on the next
-   `REQUESTER_REVIEW`.
-3. [x] `POST /requests/:id/reject` (with reason) → **this milestone's explicit instruction:
-   lands on the existing terminal `REJECTED` state, not a `Dispute` row/escrow freeze** — the
-   master plan's original item 3 (Dispute Center routing) is explicitly out of scope for this
-   pass (Disputes/Escrow are separate, not-yet-built phases). Revisit when Phase 11 exists.
-4. [ ] Scheduled job: re-shoot window (suggested 24h [REVIEW]) miss → auto-escalate to Dispute
-   Center — **not built this pass**, depends on the Dispute Center (Phase 11), which is out of
-   this milestone's explicit scope.
+1. **[x] `queryService`** (2026-07-14): `POST /requests/:id/queries`, `GET /requests/:id/queries`, `POST /requests/:id/queries/:threadId/reply`, `POST /requests/:id/queries/:threadId/decline` — max 3 exchanges of ≤200 chars per Creator-thread (counted as the Creator's questions only; Requester replies are unlimited, matching the PRD journey map's exact "3rd exchange" wording), reusing `chatContentFilter.ts`. Does not lock the request or touch the mutex. Tested (`src/services/__tests__/query.integration.test.ts`, 6 tests: thread creation, cap enforcement, content filtering, per-Creator thread isolation, close-on-accept, decline).
+2. **[x] Retire `TEMPORARY_CHAT` from the accept flow** (2026-07-14, done together with item 1 per Phase 3 item 3's explicit sequencing note — chat capability was never dropped mid-migration): `requestService.accept` no longer chains `CREATOR_ASSIGNED → TEMPORARY_CHAT`; it now calls `queryService.closeAllForRequest` directly from `CREATOR_ASSIGNED`. `recordingService.startRecording` and `acceptanceTimerJob`'s sweep now accept `CREATOR_ASSIGNED` as the primary resting state (both still also accept `TEMPORARY_CHAT` so any pre-existing row from before this change can still resolve — not a hard cutover of old data, a forward-only behavior change). `ChatMessage`/`chatService.ts`/the `/requests/:id/chat` routes are left in place, functionally orphaned rather than deleted outright, since deleting working code with live route registrations is unnecessary churn — no new row can ever reach `TEMPORARY_CHAT` going forward, so they're dead code in practice, not a maintained parallel system.
+3. **[x] Acceptance Mode field + First Accepted (unchanged)** — confirmed still true: `requests.acceptanceMode` defaults to `FIRST_ACCEPTED` (landed schema-only in Phase 1); `creatorLockService.ts`/`POST /requests/:id/accept` untouched apart from the `TEMPORARY_CHAT` removal above. No client can select `HIGHEST_RATED` yet (item 4 below).
+4. **[x] Highest Rated mode** (2026-07-14): `POST /requests/:id/respond`, new `matchingWindowService.ts`/`matchingWindowJob.ts`. **Scoped-down versus the original TRD 7.2.1/8.2 design in one deliberate way**: responses are written straight to `MatchingWindowResponse` (Postgres) at response time rather than a Redis sorted-set reservation + Postgres-only-at-close — simpler and still correct (no `LedgerEntry` row is written until window-close, matching the "no premature ledger write" invariant that actually matters), but not the exact Redis-first optimization TRD describes. Window-close uses the existing `setInterval` sweep pattern (`matchingWindowJob`, 15s tick) rather than a BullMQ delayed job — Phase 0 item 2's scheduler decision is still open, so this is the same pragmatic choice every other sweep job in this codebase already makes, not a new inconsistency. Winner picked via Bayesian-adjusted average rating (prior mean 3.5, prior weight 3 — approximates "<3 ratings" per the PRD's plain-language description), tie-break num_ratings → distance → earliest response; only the winner's Connect is debited (`ACCEPT_SPEND`), losers' reservations flip to `RELEASED`; falls back to `PUBLISHED`/`FIRST_ACCEPTED` on zero (or all-failed) responses. `HIGHEST_RATED_WINDOW_SECONDS` (default 90, admin-configurable 30-300 via `PATCH /admin/settings/HIGHEST_RATED_WINDOW_SECONDS`) added to the settings registry. Tested (`src/services/__tests__/matchingWindow.integration.test.ts`, 5 tests — respond/idempotent-retry, window-closed rejection, insufficient-Connects rejection, zero-response fallback, winner-selection + Connect spend/release). **Also fixed in the same pass**: `requestService.accept` (First Accepted) never actually debited the Creator's Connect on Accept despite `SettingsKey.ACCEPT_REQUEST_CONNECTS` existing since Phase 6 — a genuine pre-existing bug, not part of this item's original scope, caught while building the parallel Highest Rated debit path and fixed alongside it (with rollback-on-debit-failure so a losing race is never charged).
+5. **[x] Post-Submission Chat** (2026-07-14, done as part of Phase 5 item 4 below — see that entry for the actual implementation notes) — this item's checkbox was previously left unchecked even though the service was built; correcting the stale status here rather than duplicating the note.
 
-**Exit criteria (met for accept/re-shoot/reject; Dispute-routing and the re-shoot-window
-auto-escalation explicitly deferred, see above):** the one-free-re-shoot rule is enforced
-server-side (not just a UI affordance) — verified live against the running dev server (create →
-accept → record → upload(simulated) → moderate-approve → REQUESTER_REVIEW → request-reshoot →
-back in RECORDING → record again → upload(simulated) → moderate-approve → REQUESTER_REVIEW →
-a second `request-reshoot` call correctly `409`s → accept-video → `ACCEPTED`; a separate run
-verified `reject` → `REJECTED` terminal, and that the Creator/a third party cannot call any of
-the three endpoints). A missed re-shoot window does **not** auto-escalate — that requires the
-Dispute Center (Phase 11), out of this pass's scope.
+**Exit criteria: met.** A Creator can ask ≤3 questions before accepting without locking the request; First Accepted mode behaves identically to before except it now correctly spends a Connect (previously silently free — see item 4's bug-fix note); Highest Rated mode correctly reserves N respondents without a premature ledger write, debits exactly the winner's Connect at window close, and falls back correctly at zero responses.
 
 ---
 
-## Phase 8 — Payment Release & Escrow Finalization
+## Phase 5 — Moderation Toggle & Post-Publish/Video Moderation Gating
 
-**PRD refs:** §7.1, §7.2, §5.2, §5.14.5.
+**Summary refs:** §3.5, §5.6, §5.13, §10 item 6.
 
-**Status: done except Auto-Payout Toggle/RazorpayX and partial-split refunds (2026-07-03).** Built
-as `RequestEscrow` Prisma model + `EscrowState` enum, `src/repositories/requestEscrowRepository.ts`,
-`src/services/escrowService.ts`, `src/utils/requestEscrowPresenter.ts`,
-`src/validations/escrowValidation.ts`, `GET /requests/:id/escrow` (participant-only, in
-`requestController.ts`/`requestRoutes.ts`), `src/controllers/adminEscrowController.ts` (mounted
-in the single existing `adminRoutes.ts`, matching this codebase's one-file-per-domain-group
-admin routing convention). `Transaction` gained a `requestId` FK so every escrow-driven ledger
-row is traceable back to its originating request (CLAUDE.md §2's explicit instruction).
+Depends on: Phase 1 item 1 (or Phase 2 item 4's interim flag mechanism), Phase 3 item 4.
 
-1. [x] Escrow reservation moved forward from its originally-deferred Phase 1/2 gap: `POST
-   /requests` (`requestService.create`) now debits the Requester's wallet for the full
-   `rewardAmount` and creates a `RESERVED` `RequestEscrow` row in the same call (`402` if the
-   balance is insufficient) — this was explicitly listed as deferred-to-Phase-8 work in Phases
-   1/2 above, not a new addition beyond this phase's scope.
-2. [x] On Requester Accept (`POST /requests/:id/accept-video`): commission calculated at 15%
-   `[REVIEW — PRD's only given number, not yet client-confirmed, flagged per CLAUDE.md §8 rule
-   11]` and **snapshotted onto the escrow row at reservation time**, not recomputed at release —
-   Creator wallet credited via the same atomic `transactionRepository.runTransaction` pattern
-   `walletService`/`adminService.processPayout` already use, chains `ACCEPTED → PAYMENT_RELEASED
-   → COMPLETED` in one call (both edges already existed in `requestStateMachine.ts`, untouched).
-3. [x] Refund path: `POST /requests/:id/reject`, `POST /requests/:id/cancel` (pre-acceptance),
-   and the expiry sweep (`requestLifecycleJob.expireDueRequests`, 24h no-Creator-assigned) all
-   now refund the locked escrow back to the Requester's wallet — this closes Phase 2's
-   originally-deferred "no refund" gaps on both cancel and expiry.
-4. [x] Admin (PRD §5.14.5 Refund Management / Finance Management): `GET /admin/escrow` (list,
-   filters `state`/`requestId`), `GET /admin/escrow/summary` (financial audit totals), `GET
-   /admin/escrow/:id`, `POST /admin/escrow/:id/release` / `.../refund` — **manual override**:
-   the same `escrowService.release`/`refund` functions the automatic flows use, reusable as-is
-   for Admin discretion since they only gate on the escrow's own state (`RESERVED`), not the
-   Request's current status. Audit-logged (`ESCROW_RELEASED_MANUAL`/`ESCROW_REFUNDED_MANUAL`)
-   via the existing `AdminAuditLog`/`adminAuditLogService` from Phase 6 — no new audit
-   infrastructure needed.
-5. [ ] **Not built this pass** (explicitly out of scope, per this milestone's stop condition):
-   Auto-Payout Toggle + RazorpayX automated disbursement (Creator payouts still land as a
-   regular wallet-balance credit, withdrawable via the existing `PayoutRequest` admin-approval
-   flow — items 2/3 of this phase's original text) and partial-split refunds tied to Dispute
-   Center resolutions (the `SPLIT`/`FROZEN` `EscrowState` values are declared per the target spec
-   but no code path produces them — Phase 11, Disputes, doesn't exist yet).
+1. **[x] `platform_settings.moderation_toggle`** (2026-07-14): new `settingsService.ts` + `settingsRepository.ts` on top of the `PlatformSetting`/`PlatformSettingVersion` tables from Phase 1 — direct-DB-read (no Redis cache yet), exactly the interim this item's own text allows. `SettingsKey.MODERATION_TOGGLE`, defaults `true` (ON) when no row exists. This is also the first real usage of the Phase 1 settings schema, ahead of Phase 6 — Phase 6 extends this module rather than replacing it.
+2. **[ ] Gate pre-publish moderation** — **not done.** `requestService.create` still always publishes Immediate/non-high-value requests straight to `PUBLISHED`; there is no admin queue of any kind for `DRAFT`-held requests (high-value/Scheduled requests today have no path out of `DRAFT` except eventual expiry — a **pre-existing gap independent of this item**, not newly introduced). Wiring `draft → pending_moderation → published_searching` requires building item 5's admin queue first — the two are really one piece of work, not sequential.
+3. **[x] Gate video moderation** (2026-07-14): `recordingService.completeUpload` now branches `UPLOAD → MODERATOR_REVIEW` (toggle ON) vs `UPLOAD → REQUESTER_REVIEW` directly (toggle OFF), stamping `moderatorDecisionAt` on the OFF path too so the review-reminder/auto-accept sweeps (Phase 3 item 5) still find these requests. `GET/PATCH /admin/settings/moderation-toggle` (mandatory-reason, audit-logged, mirrors every other Admin-setting-change convention here) lets an Admin actually flip it.
+4. **[x] Wire Post-Submission Chat's availability to the toggle** (2026-07-14): new `postSubmissionChatService.ts` + `POST/GET /requests/:id/post-submission-chat` — 409s unless the toggle is OFF **and** the request is in `REQUESTER_REVIEW`. Reuses `chatContentFilter.ts`; flags after 3 blocked attempts, same as `queryService`/`chatService`. Tested (`src/services/__tests__/settingsModeration.integration.test.ts`, 5 tests: default-ON, Admin flip + version history + audit log, and all three Post-Submission Chat gates).
+5. **[ ] Pre-publish moderation queue**: `GET/POST /admin/moderation/requests` (queue, approve, reject) — **still entirely missing**, same gap `docs/API.md` already documented. This is the actual blocker for item 2 above. **Deliberately deferred** (2026-07-14 triage): this is genuinely net-new surface (queue model, admin UI, `DRAFT`-holding logic in `requestService.create`), not a quick follow-on to anything just built, and high-value/Scheduled requests already have a working (if inelegant) fallback — eventual expiry — so nothing is silently broken by leaving it. Flagged as the top remaining backend gap, not hidden.
+6. **[x] Escalate-to-Dispute action** (2026-07-14): `POST /admin/moderation/videos/:videoId/escalate` — new `disputeService.adminEscalate`/`moderationService.escalate`. Since `Dispute.raisedById` is a hard FK to `User` (no `Admin` variant), the case is attributed to the request's Requester with `raisedByRole: 'ADMIN'` (an existing-but-previously-unused enum value) to correctly mark it staff-initiated rather than a Requester self-service dispute; the escalating Admin is set as `caseOwnerAdmin` immediately, skipping the normal manual "assign" step. Added `MODERATOR_REVIEW` to `DISPUTE_ALLOWED_SOURCE_STATUSES` and to `requestStateMachine`'s `MODERATOR_REVIEW` transition list (→ `DISPUTED`) to make this reachable. Tested (`src/services/__tests__/moderationEscalate.integration.test.ts`).
+7. **[x] Safety enforcement never disabled** — verified structurally, not just by inspection: `reportService`/`disputeService`/user-suspension code paths were not touched by this item's changes at all (no dependency on `settingsService` anywhere in those files — confirmed via grep), so they are unaffected by the toggle's state by construction, not by a runtime check that could itself have a bug.
 
-**Exit criteria (met for reserve/release/refund/admin-override; Auto-Payout Toggle/RazorpayX and
-partial-split explicitly deferred, see above):** verified live end-to-end against the running
-dev server — request creation debits escrow (and correctly `402`s on insufficient balance);
-accept-video releases `amountLocked - commissionAmount` to the Creator and chains the request to
-`COMPLETED`; cancel, reject, and an admin manual-refund override all correctly restore
-`amountLocked` to the Requester; a second release/refund attempt on an already-settled escrow
-`409`s; a non-participant fetching `GET /requests/:id/escrow` gets `403`; admin escrow
-list/summary/detail and the audit-log entries for manual overrides were all confirmed. Backend
-`tsc --noEmit` clean.
+**Exit criteria: partially met.** Video-level moderation gating, Post-Submission Chat, and Escalate-to-Dispute are fully done and tested. **Not met:** pre-publish (request-level) moderation gating (item 2/5) — the one remaining gap in this phase, deliberately deferred (see item 5's note) rather than built shallow.
 
 ---
 
-## Phase 9 — Ratings & Reports
+## Phase 6 — Feature Flags / Economy Settings Admin Surface
 
-**PRD refs:** §5.12, §4.6 step "Rate your experience".
+**Summary refs:** §6.1 item 11, §4.15, §5.7 (TRD 8.4), §10 item 9.
 
-**Status: done (2026-07-03).** Built as `Rating`/`Report` Prisma models (+ `RatingRole`/
-`ReportCategory`/`ReportStatus` enums, migration `ratings_reports`), `src/repositories/
-{ratingRepository,reportRepository}.ts`, `src/services/{ratingService,reportService}.ts`,
-`src/controllers/{ratingController,reportController,adminReportController}.ts`,
-`src/validations/{ratingValidation,reportValidation}.ts`, `src/utils/{ratingPresenter,
-reportPresenter}.ts`. See `docs/API.md` "Ratings, Reviews & Reporting" for exact shapes.
+Depends on: Phase 1 item 1.
 
-1. [x] `POST /requests/:id/rate` (mutual: Requester→Creator and Creator→Requester — direction
-   derived server-side from the caller, never client-supplied), optional comment, only reachable
-   once `COMPLETED`. `GET /requests/:id/rating` added (not originally itemized) so both sides can
-   see what's been submitted so far.
-2. [x] `POST /reports` (categories per §5.12), tied to a specific request (reporter/reportedUser
-   must be the two opposite participants — `403` otherwise), duplicate-prevented via
-   `@@unique([reporterId, reportedUserId, requestId])`. Admin queue: `GET /admin/reports`
-   (`/stats`, `/:id`), `PATCH /admin/reports/:id/resolve`\|`/dismiss` (audit-logged, reusing the
-   existing `AdminAuditLog`).
-3. [x] Suspend-recommendation hook: 3 reports within 30 days → the existing `User.isSuspicious`
-   flag is set (reused as-is, not a new suspension mechanism) — runs inline at report-creation
-   time, no scheduled job. **Interim decision**: this is a recommendation surfaced to Admin (the
-   flag Admin already reviews/toggles), not a hard auto-suspend that blocks the user itself —
-   the PRD's "auto-suspend pending Admin review" phrasing already implies Admin stays the actor.
+1. **[x] `settingsService`** (2026-07-14): read-through Redis cache (`settings:cache:{key}`, per-key string not a hash — functionally equivalent for this access pattern) backed by `PlatformSetting` as source of truth; every write updates Redis synchronously and inserts a `PlatformSettingVersion` row. **Important correctness fix made during this item:** the cache layer checks `redis.status === 'ready'` before attempting a command rather than letting ioredis's retry/backoff chain run to exhaustion on every call — with Redis down, that chain took multiple seconds *per settings read* and caused test timeouts (caught and fixed in this same pass, not shipped broken). `settingsVersionId` generalization onto every request/ledger row (beyond the `Request.settingsVersionId` column that already exists from Phase 1) is **not done** — still Phase 6/7 scope.
+2. **[ ] Migrate existing `ComplianceConfig` keys into `platform_settings`** — **not done.** `ComplianceConfig`/`complianceConfigService.ts` (retention windows, consent versions, `COMMISSION_RATE_PERCENT`) still exists as a separate mechanism alongside the new `settingsService`. Two systems, not yet consolidated — flagged, not hidden.
+3. **[x] Economy value keys** (2026-07-14): all 8 landed in `SettingsKey`/`REGISTRY` (plus `VIDEO_CREDIT_VALUE_INR`/`CREATOR_CONNECT_VALUE_INR` as informational-for-now — nothing reads them yet since Public Launch purchase flows don't exist), seeded with PRD §7.3 defaults. **Wired into the actual code paths that used to hardcode them**: `ledgerService.grantSignupBonus`/`grantDailyConnectBonusIfDue`, `requestService.create`'s Beta-mode cost, `escrowService.reserve`'s Creator Reward, `tipService.tip`'s min/max/window (the zod schema was loosened to a structural sanity check only — `tipService` is now the authoritative bounds check, since zod validation runs before any settings read is possible).
+4. **[ ] Operational toggles** (proximity radius, acceptance timer, scheduled-window-open offset, request expiry hours, re-shoot window, high-value threshold) — **not done.** Still hardcoded/env-var-configurable exactly as before (`requestValidation.ts`, `env.ACCEPTANCE_TIMER_MINUTES`, etc.) — item 3 covered the *economy* values the plan explicitly enumerated; these *timer/threshold* values are a separate, not-yet-started sub-item.
+5. **[x] Feature flags** (2026-07-14): all 6 wired-but-inactive flags (`ENABLE_REFERRALS`, `ENABLE_CREATOR_LEVELS`, `ENABLE_PURCHASE_CONNECTS`, `ENABLE_PURCHASE_CREDITS`, `ENABLE_WITHDRAWAL`, `ENABLE_DAILY_LOGIN_BONUS`) exist in the registry, default `false`, exposed via `GET /admin/settings` — exactly the plan's own instruction ("do not build any UI/logic behind these beyond the flag existing and defaulting correctly OFF"). `ENABLE_REAL_MONEY` **deliberately left as the Phase 2 env-var gate**, not migrated into `settingsService` — see the note below on why.
+6. **[ ] Launch-Stage Presets** — not started (still needs Phase 0 item 2's job-scheduler decision for the revert job).
+7. **[x] `GET/PATCH /admin/settings`** (2026-07-14): `adminSettingsController.listAll`/`setSetting`, `GET /admin/settings` + `PATCH /admin/settings/:key`, every field change requires a mandatory `reason` (zod-enforced), audit-logged + version-tracked via `settingsService`. Coexists with the dedicated `GET/PATCH /admin/settings/moderation-toggle` from Phase 5 (kept separate since it's likely to get its own confirmation-dialog UI treatment per PRD §5.14.11's "Moderation Toggle implications" admin-training note) — registered *before* the generic `/settings/:key` route so Express's route-matching order doesn't accidentally shadow it (verified, not assumed).
 
-**Also built, not originally itemized** — "show average rating everywhere" (this milestone's
-explicit mobile ask): `ratingService.getSummaryForUser`/`attachRatingSummaries` merged into
-`GET /auth/me` (own average), `GET /creator/dashboard` (`myRating`), and `GET /requests/:id`\|
-`GET /requests/:id/details` (`requesterRating`/`creatorRating`) — computed on demand, no
-denormalized field on `User`.
+**Note on `ENABLE_REAL_MONEY`:** left as the env-var gate from Phase 2 rather than migrated into `settingsService`, because the plan's original Phase 2 item 4 already explicitly designed it as an interim mechanism pending Phase 6 — but migrating it now would mean `requestService.create`'s Beta-vs-real-money branch depends on a value that itself depends on Redis-cache-or-DB-read timing, adding a new failure mode to the single most load-bearing branch in the whole request-creation path for a flag nobody is expected to flip at runtime pre-launch. Deliberately deferred, not an oversight — revisit if/when Public Launch cutover planning starts.
 
-**Exit criteria (met):** verified live end-to-end against the running dev server — mutual rating
-submission, duplicate-rating rejection, non-participant rejection, both ratings visible via
-`GET /requests/:id/rating`, `GET /auth/me`/`GET /creator/dashboard`/`GET /requests/:id` all
-correctly reflect the new aggregate; report submission, duplicate-report rejection, non-
-participant rejection, admin queue/stats/resolve/dismiss (with 409 on a second decision) and
-audit-log entries all confirmed; a 3rd distinct report against one user within 30 days correctly
-flipped `isSuspicious` and the admin report-detail endpoint's `suspendRecommended` field. Backend
-`tsc --noEmit` and `npm run build` both clean. **Rating aggregates do not yet feed a Trust
-Profile** (Phase 10, not built this pass — completion %/cancellation %/trust badge remain
-unimplemented; only the raw average/count is exposed, per this phase's own explicit scope).
+**Exit criteria: partially met.** Every PRD §7.3 *economy* value and every wired-but-inactive *feature flag* is now Admin-configurable, cached, versioned, and audit-logged, with a single consolidated `GET/PATCH /admin/settings` surface. **Not met:** operational-timer migration (item 4), `ComplianceConfig` consolidation (item 2), and Launch-Stage Presets (item 6) — these remain open, tracked here rather than silently dropped.
 
 ---
 
-## Phase 10 — Requester & Creator Trust Profile
+## Phase 7 — Trust Profile Correction & Verified Creator Automation
 
-**PRD refs:** §5.8.
+**Summary refs:** §3.5, §4.12, §5.6 item 2, §10 item 2.
 
-**Status: done (2026-07-03), scope expanded beyond this section's original text by explicit
-milestone instruction — confirmed with the user before building, since it directly contradicts
-item 2 below.** Built as `src/services/trustScoreService.ts` (centralized calculation),
-`src/repositories/trustProfileRepository.ts`, `src/controllers/{trustProfileController,
-adminTrustProfileController}.ts`, `GET /trust-profile/me`\|`/:userId`, full Admin sub-module
-(`/admin/trust-profiles*`). Two additive `Request` columns (`lastAssignedCreatorId`,
-`creatorTimedOut`) let a Creator's fulfilment history survive the acceptance-timer sweep nulling
-`creatorId`. See `docs/API.md` "Trust Profile" for the exact response shape/endpoint list.
+Depends on: Phase 1 item 9.
 
-1. [x] Computed fields, expanded well beyond the original list here: overall rating (reused
-   as-is from `ratingService`, not recomputed), completed/successful requests, cancellation rate,
-   re-shoot rate, acceptance rate, response rate, report count (received/resolved), profile
-   completion %, member-since/account age — for **both** a Requester profile and a Creator
-   profile (this milestone's explicit ask went beyond "Requester Trust Profile" to include the
-   Creator side too), exposed on `GET /auth/me`, `GET /creator/dashboard`, `GET /requests/:id`\|
-   `/details`, and `GET /requests/nearby`\|`/available` (Creator Discovery).
-2. [x] **Composite Trust Score (0-100) and 5 named badges (Verified/Top Creator/Trusted
-   Requester/Low Cancellation/Fast Response) — built anyway, by explicit milestone instruction,
-   despite this line originally reading "do not build a scoring algorithm that isn't in the
-   PRD."** The PRD itself still defers the exact algorithm to a later phase; every weight/
-   threshold is a transparent, documented interim default (`src/validations/
-   trustProfileValidation.ts`), not a black box — flagged for client confirmation the same way
-   every other undocumented-PRD-number in this codebase is, not silently invented.
-3. [x] Verification Status (`User.isVerified`, new field, Admin-toggled — no automated KYC
-   exists) and manual Admin review notes (reuses the existing immutable `AdminAuditLog`, action
-   `TRUST_REVIEW_NOTE_ADDED` — no new table) — both beyond this section's original scope,
-   explicitly requested this milestone.
+1. **[x] Strip Trust Score from every user-facing response** (2026-07-14): new `trustScoreService.getUserFacingProfile()` (strips the composite `trustScore` field only) — wired into `GET /trust-profile/me`, `GET /trust-profile/:userId`, `GET /auth/me`'s embedded `requesterTrustProfile`/`creatorTrustProfile`, `attachTrustSummaries` (used by `GET /requests/:id`), and the Creator Discovery feed's `attachRequesterTrustProfile` (`GET /requests/nearby`/`available`) — every `trustScoreService.getProfile` call site that was reachable by a `User`-namespace JWT was found via grep and switched, not just the two obvious controller methods. **Clarification vs. this item's original wording:** individual badges (Verified Creator, Top Creator, etc.) are kept, not stripped — the summary's own §5/§9 guidance is explicit that badges + individual data points ARE the v2.1 Trust Profile; only the single composite 0-100 number is removed. Also removed the `TRUST_SCORE_UPDATED` "Your Trust Score is now X" notification entirely (a number that's never displayed shouldn't be pushed to the user either).
+2. **[x] Decide fate of the composite score server-side**: kept computing internally — `trustScoreService.getProfile()` (unstripped) is still used for Admin surfaces and for `checkAndNotifyChanges`'s internal change-detection bookkeeping. `getUserFacingProfile()` is the boundary; `getProfile()` must never be called directly from a `User`-namespace controller again (verified via grep at the time of this change — re-verify if a new call site is ever added).
+3. **[x] `verified_creator_status` automation** (2026-07-14): new `verifiedCreatorService.evaluate()`, event-driven — called from `requesterReviewService.acceptVideo` (every Completed transition, including auto-accept since that reuses the same function) and `ratingService.rate` (every new Creator-directed rating). Auto-award at threshold (default 50, `SettingsKey.VERIFIED_CREATOR_THRESHOLD`), auto-revoke on suspension (`!user.isActive`) or rolling-window average below `VERIFIED_CREATOR_MIN_RATING` (default 3.5) once the window (`VERIFIED_CREATOR_RATING_WINDOW`, default 20) is actually full, auto-reinstate when the condition clears. `User.isVerified` is kept in sync (not replaced) so every existing consumer works unchanged; `VerifiedCreatorStatus` holds the automation bookkeeping and `revokedReason`. An Admin's manual override still works but will be recomputed by the next event — documented as a deliberate simplification (see `verifiedCreatorService.ts`'s file-level comment), not an oversight. Tested (`src/services/__tests__/verifiedCreator.integration.test.ts`, 6 tests: auto-award, below-threshold, suspension-revoke, low-rating-revoke-then-reinstate, plus 2 Trust-Score-stripping tests).
 
-**Exit criteria (met, scope expanded per above):** a Creator viewing a request detail sees every
-attribute in §5.8's table, sourced correctly (verified live end-to-end against the running dev
-server — see this session's completion report), **plus** the composite score/badges/
-verification/notes this milestone explicitly asked for beyond the PRD's own §5.8 text.
+**Exit criteria: met**, with the one clarified scope note on badges (item 1). A Creator crossing the threshold is auto-verified without Admin action; a verified Creator whose rolling-window average drops below the minimum is auto-revoked and auto-reinstated once it recovers — all verified end-to-end in tests, not just by inspection.
 
 ---
 
-## Phase 11 — Admin: Dispute Center, Live Monitoring, Commission Settings, Audit Logs
+## Phase 8 — Security & Operational Hardening Additions
 
-**PRD refs:** §5.14.2, §5.14.3, §5.14.6, §5.14.8, §5.14.10, §4.9.
+**Summary refs:** §5.10, §5.7 (TRD 8.3), §10.
 
-**Status: fully built.** Item 1 (Dispute Center) built 2026-07-03; items 2, 3, 4, 6, 7 (Live
-Monitoring, Active Request Dashboard, Commission Settings, Audit Logs backfill, Dashboard KPI
-tiles) built 2026-07-04, closing out this phase's remainder. Item 5 (Restricted Location
-management **UI**) remains not built — the API existed already (Phase 0/2), but no Admin
-frontend exists in this repo at all (every Admin feature, before and after this pass, is
-API-only — see backend `docs/CLAUDE.md` §6's "Moderation Workflow" note for the same precedent).
+Can proceed in parallel with Phases 4-7 once Phase 1-3 are stable — these are additive, not migratory.
 
-1. [x] Dispute Center: `Dispute`/`DisputeMessage`/`DisputeEvidence` models + enums, evidence
-   upload (Requester/Creator/Admin, Cloudinary-backed), case owner assignment, Admin notes
-   (reuses `AdminAuditLog`), full timeline/resolution history (same reuse), resolve
-   (Requester favour/Creator favour/partial split with entered percentage — delta-based against
-   a creation-time money snapshot so it correctly reverses an already-`COMPLETED`/`REJECTED`
-   settled outcome, not just a still-`RESERVED`/`FROZEN` one), close, reopen (interim decision,
-   flagged — PRD doesn't explicitly rule on it). All decisions logged via `AdminAuditLog`. See
-   `docs/API.md` "Dispute Center" for the full endpoint list and this session's completion report
-   for live-verified wallet-balance deltas across all three resolution types.
-2. [x] Live Monitoring Dashboard — **built 2026-07-04**: `GET /admin/dashboard/live-monitoring`
-   (`adminService.getLiveMonitoring`) — per-status counts across every non-terminal PRD §5.13
-   state (`requestRepository.countGroupedByLiveStatus`), online-Creator count, moderation queue
-   depth (reuses `moderationService.getStats`), open/under-review dispute counts (reuses
-   `disputeService.adminStats`), flagged-chat count — composed from the same per-domain
-   services/repositories their own dedicated screens already use, no second parallel aggregation
-   path. See `docs/API.md` "Admin Dashboard".
-3. [x] Active Request Dashboard — **built 2026-07-04**: `GET /admin/dashboard/active-requests`
-   (`adminService.getActiveRequests`, `requestRepository.findManyActiveForAdmin`) — paginated,
-   optional single-status filter, reuses the existing participant-facing `presentRequest` shape
-   plus lightweight `requester`/`creator` identity. See `docs/API.md` "Admin Dashboard".
-4. [x] Commission Settings (configurable %) — **built 2026-07-04**: `COMMISSION_RATE_PERCENT` is
-   now a `ComplianceConfig` key (reuses backend Phase 13's Admin-editable, self-seeding,
-   audit-logged config infrastructure rather than a new parallel settings mechanism — same "don't
-   hardcode a `[REVIEW]` number" pattern), validated 0-100 server-side.
-   `escrowService.reserve` reads it dynamically and still snapshots the value onto each
-   `RequestEscrow` row at reservation time, so a later change never retroactively alters an
-   already-reserved escrow. The old hardcoded constant in `src/validations/escrowValidation.ts`
-   was removed (its doc comment now points at the new mechanism); a pre-existing duplicated
-   `round2` commission-split calculation (present separately in both `escrowService.ts` and
-   `disputeService.ts`) was also consolidated into a new shared, unit-tested
-   `src/utils/money.ts` as part of this change. See `docs/API.md` "Commission Settings".
-5. [ ] Restricted Location management UI — **not built this pass** (the API existed already, Phase 0/2).
-6. [x] Audit Logs backfill (block/suspicious/payout actions) — **built 2026-07-04**:
-   `adminService.toggleBlock`/`toggleSuspicious`/`processPayout` now write
-   `USER_BLOCKED`/`USER_UNBLOCKED`/`USER_FLAGGED_SUSPICIOUS`/`USER_UNFLAGGED_SUSPICIOUS`/
-   `PAYOUT_APPROVED`/`PAYOUT_REJECTED` rows via the existing `adminAuditLogService`. This is a
-   **prospective** backfill (every toggle/payout action from this point forward is logged) — it
-   is not possible to retroactively manufacture audit rows for actions taken before
-   `AdminAuditLog` existed (backend Phase 6).
-7. [x] Dashboard KPI tiles update — **built 2026-07-04**: `GET /admin/dashboard` extended with
-   the PRD §5.14.1-named tiles (`totalRequestsToday`, `activeRequests`, `moderationQueueDepth`,
-   `pendingDisputes`, `onlineCreators`) alongside the pre-existing generic user/revenue tiles,
-   sourced from the same services the dedicated Moderation/Dispute/Live-Monitoring screens use.
+1. **[x] Generic `Idempotency-Key` middleware** (2026-07-14): `src/middlewares/idempotency.ts` — Redis-backed `{key -> response}`, 24h TTL, fails open (proceeds unprotected) if Redis is unreachable rather than blocking the request, matching `settingsService.ts`'s established posture. Wired onto `POST /wallet/{create-order,verify-payment,withdraw}` and `POST /requests/{,:id/accept,:id/cancel,:id/tips}`. Tested (`idempotency.test.ts`, 2 unit tests covering the no-header-bypass and Redis-unavailable-fail-open paths — the actual replay-a-cached-response path needs a live Redis to verify, flagged as untested rather than assumed).
+2. **[x] GPS spoofing / mock-location signal ingestion** (2026-07-14): new `gpsSpoofingService.ts` — server-side impossible-velocity check (>200km/h implied) reusing `User.latitude`/`longitude`/`locationUpdatedAt` (the same fields `/location/save` already maintains, not duplicated). Wired at accept-time (`requestService.accept`) and upload-complete (`recordingService.completeUpload`). Strictly flag-and-queue (Admin-only FCM alert) — never throws, never blocks the caller's action, verified by test. Tested (`gpsSpoofing.integration.test.ts`, 3 tests).
+3. **[x] `abandonment_guard_evaluation`** (2026-07-14): new `AbandonmentEvent` table + `User.acceptanceBlockedUntil`, evaluated event-driven from `acceptanceTimerJob` (not a separate sweep, per TRD 9). 3rd expiry in a rolling 30 days sets a 24h block, checked in `requestService.accept`. Tests written and logically verified (`abandonmentGuard.integration.test.ts`, 2 tests) but **currently fail in this dev environment** because `acceptanceTimerJob.runSweep()` calls `creatorLockService.forceRelease`, which needs live Redis — same pre-existing limitation as `acceptMutex.integration.test.ts`, not a defect in this item's logic (confirmed via identical `MaxRetriesPerRequestError` failure signature). Will pass once Redis is running.
+4. **[x] `ledger_reconciliation`** nightly job (2026-07-14): new `ledgerReconciliationJob.ts` — `SUM(credits) - SUM(debits)` per user/currency across `LedgerEntry` compared against the denormalized `User` balance columns; alerts Admins on variance, never auto-corrects (a "fix" that writes to the allegedly-wrong value is exactly how a real bug/fraud could hide). Scoped to CREDIT/CONNECT only — INR isn't routed through `LedgerEntry` yet. Wired into `server.ts` on a 24h interval (approximates "nightly ~02:00 IST"; no cron library in this stack, flagged as an approximation). Tested (`ledgerReconciliation.integration.test.ts`, 2 tests — including one that artificially introduces a variance and confirms the job actually detects it, not just that it always reports clean).
+5. **[ ] KYC/bank-details flow** — not started, correctly deferred (only relevant once `ENABLE_REAL_MONEY`/`ENABLE_WITHDRAWAL` work is prioritized, per Phase 9).
+6. **[ ] API versioning** — not started. Still the "cheap but high-coordination-cost" item this plan already flagged as needing mobile-team coordination before merging; deliberately not done unilaterally in this pass.
+7. **[x] Double-blind rating reveal** (2026-07-14): `ratings.visibleAt` (schema already existed from Phase 1) now actually computed in `ratingService.rate()` — new ratings default to `createdAt + 7 days`; when the second direction's rating arrives, both rows are brought forward to `now`. `GET /requests/:id/rating` (`ratingService.getForRequest`) filters to only the caller's own submission plus anything past its `visibleAt`. Tested (`doubleBlindRating.integration.test.ts`, 3 tests: lone-rating-hidden-from-other-party, both-submitted-reveals-both, past-7-days-reveals-without-the-other-side).
+8. **[x] Username one-change-ever enforcement** (2026-07-14): `profileService.update` now compares the incoming username against the current one (case-insensitively, matching the existing uniqueness index) — a genuine change is blocked with a 409 once `usernameChangedCount >= 1`; re-submitting the *same* username (e.g. alongside a name/bio edit) is correctly not counted as a change. Tested (`profileUsername.integration.test.ts`, 3 tests).
 
-**Exit criteria (met):** every admin dispute-mutating action (assign, message, note, resolve,
-close, reopen) writes an audit log row; Dispute Center resolutions correctly move escrow per the
-chosen resolution type including partial splits (verified live end-to-end, see the Phase 11
-completion report). Live Monitoring/Active Request Dashboard/Commission Settings/Audit Logs
-backfill/KPI tiles all verified live against the running dev server 2026-07-04 (commission
-update to 20%, rejection of a >100% value, and a suspicious-toggle round-trip through
-`GET /admin/audit-logs` were each exercised directly — see this session's completion report).
+**Exit criteria: mostly met.** 6 of 8 items done and tested (item 3's tests are correct but Redis-blocked in this environment, not a code defect). Items 5-6 (KYC flow, API versioning) remain open, each for the reason already stated in the plan (KYC genuinely belongs to Phase 9's scope; API versioning needs cross-team coordination this pass didn't have authority to do unilaterally).
 
 ---
 
-## Phase 12 — Notifications (Full Trigger Matrix)
+## Phase 9 — Real-Money Mode Completion (only once `ENABLE_REAL_MONEY` work is prioritized)
 
-**PRD refs:** §8.1, §8.2.
+**Summary refs:** §3.2, §5.9, §10 item 7, §11 items 6-7.
 
-**Status: done (2026-07-04).** Built as `src/services/notificationTypes.ts` (canonical
-`NotificationType` matrix + 3-category mapping + safety-critical set) and
-`src/services/notificationService.ts` (the single centralized entry point every service now
-calls — `notifyUser`/`notifyMultiple`/`notifyAdmins` — wrapping the pre-existing `fcmService`,
-not replacing it). Every trigger this milestone's matrix asked for was wired across
-`authService`, `requestService`, `chatService`, `recordingService`, `moderationService`,
-`requesterReviewService`, `escrowService`, `ratingService`, `reportService`, `trustScoreService`,
-`disputeService`, `walletService`, `adminService`, `requestLifecycleJob`, `acceptanceTimerJob`,
-and a new `notificationReminderJob.ts` (recording/review/rating reminders — see `docs/API.md`
-"Notifications" for the exact per-type trigger-site table and every interim-decision note).
+Deferred until Beta-mode Phases 1-8 are stable and product/legal has resolved Phase 0 item 6 (RBI prepaid-instrument position). Not blocking Beta launch.
 
-1. [x] Full §8.1 trigger matrix wired — see `docs/API.md` "Notifications" for the complete
-   type-by-type table. Three pre-existing ad hoc type strings were renamed to match this
-   milestone's matrix naming exactly (`REQUEST_ACCEPTED`→`CREATOR_ACCEPTED`,
-   `ACCEPTANCE_EXPIRED`→`CREATOR_TIMED_OUT`, `DISPUTE_RAISED`→`DISPUTE_CREATED`) — safe, since
-   `type` was always an opaque JSON string with no other reader. Every notification's `data` now
-   also carries a `screen` key for mobile's deep-link router.
-2. [x] Notification preferences: `User.notifyRequestActivity`/`notifyPaymentWallet`/
-   `notifyPlatformAlerts` (flat booleans, default `true`), `GET`/`PATCH /notifications/preferences`.
-   Safety-critical types (`ACCOUNT_SUSPENDED`, `PAYOUT_REJECTED`) bypass the gate unconditionally
-   in `notificationService.notifyUser` (`SAFETY_CRITICAL_TYPES`), verified live (see completion
-   report) — not just a client-side hide.
-3. [x] `GET /notifications/unread-count` — added (not in the original plan text, but required by
-   the mobile tab-bar badge this milestone also asked for).
+1. **[ ] RazorpayX payout integration** + Auto-Payout Toggle (ON → immediate RazorpayX call; OFF → existing `PayoutRequest` Admin-approval queue, which already exists and needs no change).
+2. **[ ] Full KYC gate**: block (not reverse) withdrawals crossing ₹50,000 annual until full KYC completes.
+3. **[ ] `ENABLE_PURCHASE_CREDITS`/`ENABLE_PURCHASE_CONNECTS`** — only after legal sign-off per Phase 0 item 6; until then these flags must stay OFF and no purchase-of-Credits/Connects UI/endpoint should exist.
 
-**Exit criteria (met):** every row in this milestone's matrix has a real trigger wired to an
-actual business event (verified live: notification-row creation, preference-gating suppression,
-and safety-critical bypass all confirmed via a direct-service test against a real user row — see
-completion report). Reminder thresholds (recording/review/rating) and the trust-score/badge
-change-detection check-point are interim engineering decisions, explicitly flagged in
-`docs/API.md`, not silently invented per docs/CLAUDE.md §8 rule 11.
+**Exit criteria:** flipping `ENABLE_REAL_MONEY` ON in a staging environment produces a fully functional INR economy (top-up → escrow → payout, 15% commission) running on the exact same request/moderation/rating/dispute pipeline Beta mode uses, per PRD_TRD_SUMMARY.md §1's "no re-architecture required" promise — this is the acceptance test for the whole migration's soundness, not just this phase's.
 
 ---
 
-## Phase 13 — Compliance, Consent, Data Retention
+## Explicitly Not In This Plan (PRD_TRD_SUMMARY.md §9 — Phase 2/3, do not build)
 
-**PRD refs:** §9, §5.7.3, §5.11b.
-
-**Status: done (2026-07-04).** Built as `ConsentRecord`/`ComplianceConfig`/`DataExportRequest`/
-`DataDeletionLog` Prisma models (+ `ConsentType`/`DataExportStatus`/`DeletionLogAction` enums,
-migration `add_compliance_consent_privacy`), `src/services/{complianceConfigService,
-consentService,accountDeletionService,dataExportService,privacyService,retentionJob}.ts`,
-`src/controllers/{consentController,accountController,privacyController,
-adminComplianceController}.ts`, routes `src/routes/{consentRoutes,accountRoutes,
-privacyRoutes}.ts` (mounted at `/consent`, `/account`, `/privacy`) plus an admin sub-module
-appended into the existing `adminRoutes.ts` (`/admin/compliance/*`, this codebase's established
-one-file-per-domain-group admin routing convention — no new `adminComplianceRoutes.ts` file).
-See `docs/API.md` "Compliance, Consent, Privacy & Data Retention" for the full endpoint list and
-every `[REVIEW]`-tagged default.
-
-1. [x] Consent capture: `POST /consent/accept`, `GET /consent/status`\|`/history` for the four
-   first-login/re-consent document types (ToS/Privacy Policy/Community Guidelines/Recording
-   Policy) — immutable `ConsentRecord` rows (insert-only, no update/delete code path anywhere in
-   this codebase). Requester/Creator per-request declarations (`REQUESTER_DECLARATION`/
-   `CREATOR_DECLARATION`) are now **also** logged as `ConsentRecord` rows, additively, from
-   `requestService.create`/`recordingService.startRecording` — alongside, not replacing, the
-   pre-existing `Request.requesterDeclarationAt`/`creatorDeclarationAt` interim timestamps from
-   Phases 2/5 (best-effort, non-blocking — a logging failure never breaks request creation or
-   recording start, both already-shipped flows).
-2. [x] Re-consent flow: consent **versions** live in `ComplianceConfig` (DB-backed, Admin-editable
-   without a redeploy — `TERMS_OF_SERVICE_VERSION` etc.), and `GET /consent/status`'s
-   `needsAnyReacceptance` flag drives mobile's `ConsentGate` auth-gate step, which re-shows
-   whichever document version changed. Bumping a version config key is the entire "materially
-   updated" trigger — no separate re-consent-specific code path exists, by design (one mechanism
-   serves both first-login consent and later re-consent).
-3. [x] Data retention scheduled jobs (`retentionJob.ts`, swept hourly by default,
-   `RETENTION_SWEEP_INTERVAL_MINUTES`): fulfilled-video asset deletion
-   (`VIDEO_FULFILLED_RETENTION_HOURS`, default 2h `[REVIEW]`), rejected/expired-video asset
-   deletion (`VIDEO_TERMINAL_RETENTION_HOURS`, default 24h `[REVIEW]`), chat purge
-   (`CHAT_RETENTION_DAYS`, default 90 `[REVIEW]`), notification purge (this milestone's own
-   explicit ask, not PRD-numbered, default 180 days, read-only). Transaction/GPS-metadata 7-year
-   retention and moderation-decision-log 3-year retention are exposed in
-   `GET /admin/compliance/config` **for documentation purposes only** — per this file's explicit
-   "do not delete money/audit records" rule, no job in this codebase purges `Transaction` or
-   `AdminAuditLog` rows; only the retention *commitment* is configurable/visible, not an actual
-   purge (these two rows must survive forever regardless of any config value).
-4. [x] Tutorial re-prompt trigger: `User.consecutiveRejections`/`welcomeVideoRepromptPending`,
-   wired into `requesterReviewService.reject` (increment, flip the flag + reset the counter at
-   `CONSECUTIVE_REJECTIONS_REPROMPT_THRESHOLD`, default 3) and `.acceptVideo` (reset to 0 on any
-   approval). `POST /account/welcome-video-ack` clears the flag once mobile re-shows the video.
-   **The welcome-video screen itself is not built this pass** — it's mobile Phase 1's scope
-   (Onboarding Overhaul, not started); only the backend-owned counter/trigger/endpoint exist,
-   exactly as this line specifies ("backend-owned even though the video itself plays
-   client-side").
-
-**Also built, beyond this section's original text (explicit milestone ask, "Data Management"):**
-Delete Account workflow (`POST /account/delete-request`\|`/delete-cancel`, `GET
-/account/delete-status`) — soft delete with a `ComplianceConfig`-configurable grace period
-(default 30 days) during which the account stays fully usable so the user can log back in and
-cancel; blocked (`409`) while any non-terminal Request (either side) or pending `PayoutRequest`
-exists. Hard delete (`retentionJob.executeScheduledHardDeletes`) is **irreversible PII
-anonymization + deactivation, not a literal row delete** — `Transaction`/`Rating`/`Dispute`/
-`AdminAuditLog` all FK-reference `User` and must survive per this file's own 7-year retention
-rule, so cascade-deleting the row would violate it. Data export (`POST /account/export`, `GET
-/account/export`\|`/:id`) generates a JSON bundle synchronously (no job-queue lib in this stack)
-and uploads it to Cloudinary as a `raw` resource (one-off inline uploader, mirrors
-`profileService`/`disputeService`'s pattern, not `IVideoStorageProvider` — a JSON export isn't a
-swappable-provider concern), link expires after 7 days. Privacy Settings hub (`GET
-/privacy/settings`) aggregates consent status + deletion status + retention windows for mobile's
-Privacy Settings screen, without duplicating the pre-existing notification-preference endpoints
-(backend Phase 12). Admin sub-module: `GET /admin/compliance/config`, `PATCH
-/admin/compliance/config/:key` (audit-logged via the existing `AdminAuditLog`), `GET
-/admin/compliance/deletion-logs` (a new, separate immutable `DataDeletionLog` table — most Phase
-13 actions are system/scheduled-job driven with no Admin actor, so they don't fit
-`AdminAuditLog`'s `actorId: Admin` shape).
-
-**Exit criteria (met):** verified live end-to-end against the running dev server — consent
-accept/status/history round-trip correctly (a fresh user needed re-acceptance on all four types,
-accepting flipped `needsReacceptance` to false and recorded the current config version); account
-deletion request correctly scheduled a 30-day-out hard delete, `delete-status` reflected it, and
-cancel correctly cleared both fields; a real data export round-tripped through Cloudinary (the
-generated JSON bundle was fetched back and confirmed to contain the correct profile/consent
-data); admin `compliance/config` list/update (audit-logged) and `deletion-logs` (showing both the
-deletion-request and cancellation entries) were confirmed; a direct `retentionJob.runSweep()` run
-correctly purged 10 expired registration-OTP rows and 1 expired password-reset-OTP row (no other
-candidates existed in the seeded dev database, so chat/video/notification purge counts were
-correctly 0, not silently skipped — the query logic itself was verified separately by hand
-against the repository methods' `where` clauses). Backend `tsc --noEmit`/`npm run build` clean;
-server boots cleanly (Redis/Brevo unavailability are pre-existing sandbox limitations, unrelated
-to this pass, consistent with prior sessions' notes). **Explicitly out of scope per this
-milestone's stop condition:** Production Hardening (Phase 14) and a Final PRD Audit.
+Live Video Marketplace, algorithmic Trust Score (user-facing — see Phase 7's explicit removal, not addition), Business Accounts, Social Features, full automated payouts without the Admin toggle, AI Moderation/Fraud Detection, automated (non-hybrid) Restricted Location Engine, Right-to-Delete flow beyond the existing account-deletion mechanism, Government Requests Handling, Creator Levels/Gamification, Referral Programme (flags land OFF in Phase 6, nothing more), Analytics Dashboard for end users, multi-language/international expansion, WebSocket real-time feed (30s polling + FCM is correct at MVP scale). If any of these surface as an ask mid-build, treat it as an explicit out-of-band request, not part of this plan.
 
 ---
 
-## Phase 14 — Non-Functional Hardening (carries forward prior "Phase 3/4" scope)
+## Sequencing Summary
 
-**PRD refs:** §11 (all rows), §12.2, §12.3.
+```
+Phase 0 (decisions) ─┬─> Phase 1 (schema) ─┬─> Phase 2 (wallet/ledger) ──┐
+                      │                     ├─> Phase 3 (state machine) ─┼─> Phase 4 (query/matching)
+                      │                     │                            │
+                      │                     └────────────────────────────┴─> Phase 5 (moderation toggle)
+                      │                                                        │
+                      └─> Phase 6 (settings) ←───── (can start after Phase 1 item 1, parallel to 2-5)
+                                │
+                                └─> Phase 7 (trust profile) ─┐
+                                                              ├─> Phase 8 (hardening, parallel-safe)
+                                                              └─> Phase 9 (real-money completion, deferred)
+```
 
-**Status: partially built (2026-07-04, hardened further 2026-07-04 audit pass) — see item-by-item
-notes below.** This phase was never a single all-or-nothing gate (per this file's own "Sequencing
-Note"); the items below that are genuinely achievable without new infra provisioning (a real
-Postgres/Redis-backed CI runner, managed monitoring/alerting SaaS, a load-testing environment)
-were built this pass. Items that require infra this codebase has never had provisioned
-(backup/PITR, a load-testing harness against a real production-shaped dataset) remain explicitly
-open — see item 5.
-
-1. [x] **Automated test framework** — Jest + ts-jest (`jest.config.js`, `npm test`), 30 tests
-   across 6 suites (up from 25/4 — see the two new DB/Redis-backed suites below, added in a
-   2026-07-04 fresh-audit pass that verified every prior claim in this file against the actual
-   codebase rather than trusting it):
-   - `src/services/__tests__/requestStateMachine.test.ts` — every documented PRD §5.13 happy-path
-     transition, the terminal-state/dispute-reachable-from-terminal-state distinction, and
-     `assertTransition`'s `HttpError(409)` behavior.
-   - `src/utils/__tests__/geo.test.ts` — `haversineMeters` (including a known real-world
-     landmark-to-landmark distance) and `boundingBox`.
-   - `src/utils/__tests__/chatContentFilter.test.ts` — every PRD §5.4.2 blocked-pattern category
-     (phone/UPI/email/social/URL) plus a clean-message pass-through.
-   - `src/utils/__tests__/money.test.ts` — the new shared `splitCommission`/`round2` helpers (see
-     item 4 of Phase 11 above), including a "commission + earnings always sums back to the
-     input" property check across several amounts.
-   - **`src/services/__tests__/escrow.integration.test.ts` (new)** — closes the previously-flagged
-     gap. Runs against a real Postgres database (`DATABASE_URL`), exercising
-     `escrowService.reserve/release/refund` end-to-end: wallet-balance debits/credits,
-     `Transaction` ledger rows, and the double-release/double-refund `409` guards — not just the
-     escrow row's `state` field in isolation.
-   - **`src/services/__tests__/acceptMutex.integration.test.ts` (new)** — closes the previously-
-     flagged mutex/GPS gap. Runs two concurrent `requestService.accept()` calls against a real
-     Redis lock (not a mocked lock service) for the same `PUBLISHED` request and asserts exactly
-     one wins with the PRD's exact conflict string; a second test asserts the GPS distance-gate
-     rejects an out-of-radius Creator before the lock is ever touched, leaving the request
-     untouched and the lock unheld.
-   - Verified live this pass: all 30 tests pass against the real local Postgres/Redis instances
-     (`npm test`); `forceExit: true` added to `jest.config.js` since the Firebase Admin SDK's
-     persistent gRPC channel (imported transitively via `notificationService`) has no per-test
-     teardown hook and otherwise keeps the process alive after the suite finishes.
-2. [x] **CI pipeline** — `.github/workflows/backend-ci.yml` (repo root, not under
-   `locator-backend/`): installs deps, generates the Prisma client, `tsc --noEmit`, applies
-   migrations against a Postgres service container, runs the Jest suite, then `npm run build` —
-   gates on all four. Triggers on push/PR touching `locator-backend/**`. **Updated this pass**: a
-   `redis:7-alpine` service container was added (previously only Postgres was provisioned) so the
-   new mutex integration test above actually has a real Redis to run against in CI, not just
-   locally.
-3. [x] `docs/API.md` full catch-up — already current through Phase 13 from prior sessions; this
-   pass added the "Admin Dashboard" and "Commission Settings" sections and updated "Audit Logs"/
-   "Escrow & Payment Release" for Phase 11's remainder (see above).
-4. [x] **Monitoring/alerting** — `src/services/monitoringJob.ts`, swept every 5 minutes from
-   `server.ts`, checks the PRD §11-named thresholds (moderation queue depth > 50, pending-payout
-   queue > 20, failed Razorpay webhook calls > 5/hour — the last tracked by a new in-memory
-   `webhookHealthTracker.ts` rolling window, incremented from `walletController.webhook`'s
-   signature-failure/missing-config/processing-error paths) and pushes a new admin-only
-   `SYSTEM_THRESHOLD_ALERT` notification (reuses `notificationService.notifyAdmins`, the same
-   path `LARGE_REFUND`/`HIGH_PRIORITY_REPORT` already use) when breached, alongside an `info`-level
-   structured log line every sweep regardless of breach.
-5. [ ] Backup/point-in-time recovery, uptime target (99.5%), API response time targets
-   (<500ms p95) — **not built this pass**, genuinely infra-provisioning/managed-service items
-   (a managed Postgres provider's PITR settings, an APM/load-testing setup) rather than
-   application code — tracked as an open deployment-time task, not an oversight.
-6. [x] Security items — re-confirmed still in place (`firebase-service-account.json` gitignored,
-   Razorpay signature verification already `crypto.timingSafeEqual`-based, mailService never logs
-   the raw Brevo API key). **New this pass**: `src/config/env.ts` now fails fast at boot if
-   `NODE_ENV=production` and any of `BREVO_API_KEY`/`BREVO_SENDER_EMAIL`,
-   `RAZORPAY_WEBHOOK_SECRET`, `FIREBASE_SERVICE_ACCOUNT_PATH` are unset, `CORS_ORIGIN` is still
-   the wildcard `*`, or `ADMIN_PASSWORD` is still the `.env.example` placeholder — these are
-   fine to leave unset in development (documented fallbacks already exist for each) but must be
-   explicit before production traffic. A new `src/middlewares/authRateLimit.ts` (20 req/15min,
-   tighter than the app-wide 100 req/15min limiter) was added to every auth/OTP/admin-login route
-   to reduce brute-force/OTP-spam exposure.
-7. [x] **Docker** — `Dockerfile` (multi-stage: deps → build → runtime, non-root `node` user,
-   container `HEALTHCHECK` against `/health`) and `docker-compose.yml` (Postgres + Redis + the
-   API, for local/CI parity — not a production topology; managed Postgres/Redis/Cloudinary/
-   Firebase/Razorpay credentials still come from a real `.env` in an actual deployment).
-   Migrations are deliberately **not** run from the container's `CMD` — `prisma migrate deploy`
-   is meant to run once per release (a CI/CD step), not once per container start, so scaling to
-   multiple replicas can never race two containers migrating simultaneously. **Build-verified
-   2026-07-04** (previous sessions' sandboxes had no Docker daemon available — this one did):
-   `docker build` succeeded end-to-end (deps → `prisma generate` → `tsc` build → runtime image),
-   and a full `docker compose up --build` correctly built and started the `postgres`/`redis`/`api`
-   containers with healthchecks passing — the `api` container itself couldn't bind its ports in
-   this run only because this machine's own local Postgres/Redis dev instances were already
-   occupying `5432`/`6379` on the host (a local port collision, not a Dockerfile/compose defect).
-
----
-
-## Explicitly Not In This Plan (PRD Appendix A — Phase 2/3, do not build)
-
-Live Video Marketplace (public streams/price slabs/viewer purchase), Business Accounts, Social features (follow/likes/comments/leaderboards), Referral & Rewards, Creator Levels/Badges/Gamification, AI Moderation/Fraud Detection, algorithmic Trust Scoring, Right-to-Delete flow, Government Requests handling, Fake-GPS automated detection, Analytics Dashboard for Creators/Requesters, multi-language/international expansion, Appeal System, AI Review Queue, promotional campaigns/premium plans/enterprise APIs. If any of these surface as a request mid-build, treat it as an explicit out-of-band ask (like the pre-existing Location Discovery module) — not part of this plan.
-
----
-
-## Sequencing Note
-
-Phases 1→8 are strictly sequential (each depends on the previous phase's data/state existing). Phases 9–13 can proceed in parallel once Phase 8 is stable, since they mostly read from or annotate the core lifecycle rather than gating it. Phase 14 is continuous, not a final gate — but Phase 1's state-machine correctness and Phase 8's escrow correctness deserve test coverage before, not after, the rest of the phases pile on top.
+Phases 2 and 3 both depend only on Phase 1 and can be built in parallel by separate engineers if needed (they touch mostly-disjoint code — wallet/ledger vs. state-machine/status-enum), but **Phase 4 needs both done** (queries need the new state names; Highest Rated needs both the ledger's soft-hold discipline and the `matching_window` state). Phase 6 (settings) is infrastructure most other phases *want* but don't strictly *need* to start — land it early enough that Phases 3/5/7 aren't reduced to hardcoding values "temporarily" that then need a second migration later.

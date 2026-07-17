@@ -2,8 +2,8 @@ import {Response} from 'express';
 import {RequestCategory, RequestStatus, RequestType} from '@prisma/client';
 
 import {AuthenticatedRequest} from '../middlewares/authMiddleware';
-import {chatService} from '../services/chatService';
 import {escrowService} from '../services/escrowService';
+import {matchingWindowService} from '../services/matchingWindowService';
 import {requestService} from '../services/requestService';
 import {sendSuccess} from '../utils/apiResponse';
 
@@ -36,6 +36,12 @@ export const requestController = {
   async cancel(req: AuthenticatedRequest, res: Response) {
     const data = await requestService.cancel(req.user!.id, req.params.id as string, req.body.reason);
     sendSuccess(res, 200, 'Request cancelled.', data);
+  },
+
+  async estimatedResponseTime(req: AuthenticatedRequest, res: Response) {
+    const {category} = req.query as unknown as {category: RequestCategory};
+    const data = await requestService.estimatedResponseTimeMinutes(category);
+    sendSuccess(res, 200, 'Estimated response time fetched.', data);
   },
 
   async nearby(req: AuthenticatedRequest, res: Response) {
@@ -93,16 +99,12 @@ export const requestController = {
     sendSuccess(res, 200, 'Request accepted.', data);
   },
 
-  // --- Temporary Chat (PRD §5.4) ----------------------------------------------------------
+  // --- Highest Rated matching window (PRD_TRD_SUMMARY.md §5.6, backend Phase 4 item 4) --------
 
-  async listChat(req: AuthenticatedRequest, res: Response) {
-    const data = await chatService.list(req.user!.id, req.params.id as string);
-    sendSuccess(res, 200, 'Chat messages fetched.', data);
-  },
-
-  async sendChat(req: AuthenticatedRequest, res: Response) {
-    const data = await chatService.send(req.user!.id, req.params.id as string, req.body.body);
-    sendSuccess(res, 201, 'Message sent.', data);
+  async respondToMatchingWindow(req: AuthenticatedRequest, res: Response) {
+    const {latitude, longitude} = req.body as {latitude: number; longitude: number};
+    const data = await matchingWindowService.respond(req.user!.id, req.params.id as string, {latitude, longitude});
+    sendSuccess(res, 200, 'Response recorded.', data);
   },
 
   // --- Escrow & Payment Release (PRD §7.1, §7.2, backend Phase 8) ------------------------

@@ -3,7 +3,20 @@ import {Prisma} from '@prisma/client';
 import {prisma} from '../prisma/client';
 
 const detailInclude = {
-  request: {select: {id: true, description: true, status: true, requesterId: true, creatorId: true}},
+  request: {
+    select: {
+      id: true,
+      description: true,
+      status: true,
+      requesterId: true,
+      creatorId: true,
+      latitude: true,
+      longitude: true,
+      radiusMeters: true,
+      acceptedAt: true,
+      expiresAt: true,
+    },
+  },
   raisedBy: {select: {id: true, name: true, username: true, profileImage: true}},
   resolvedByAdmin: {select: {id: true, name: true, email: true}},
   caseOwnerAdmin: {select: {id: true, name: true, email: true}},

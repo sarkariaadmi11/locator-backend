@@ -9,7 +9,16 @@ export const REQUEST_HIGH_VALUE_THRESHOLD = 1000;
 export const REQUEST_DEFAULT_RADIUS_METERS = 500;
 export const REQUEST_MIN_RADIUS_METERS = 100;
 export const REQUEST_MAX_RADIUS_METERS = 2000;
-export const REQUEST_EXPIRY_HOURS = 24;
+// v2.1 change (PRD_TRD_SUMMARY.md §10 item 5, backend Phase 3 item 2): Immediate requests now
+// expire 5 hours after publishing (was 24h in v2.0 — every 24h reference is superseded).
+export const REQUEST_EXPIRY_HOURS = 5;
+// v2.1 change: Scheduled requests now require a minimum 4-hour lead time (was 30 minutes in
+// v2.0). The full "acceptance window opens 2-4h (admin-configurable, default 4h) before the
+// scheduled slot" mechanic is a separate, not-yet-built background-job change (Phase 3 item 4,
+// "insert pending_moderation/published_searching split") — this constant only enforces the
+// minimum lead time at creation; today's scheduled sweep still opens the request for
+// acceptance at `scheduledAt` itself; see requestLifecycleJob.ts.
+export const REQUEST_SCHEDULED_MIN_LEAD_HOURS = 4;
 
 export const createRequestSchema = z
   .object({
@@ -34,6 +43,8 @@ export const createRequestSchema = z
       .max(REQUEST_MAX_REWARD, `Reward must be at most ₹${REQUEST_MAX_REWARD}.`),
     category: z.enum(['TRAFFIC', 'EVENTS', 'FOOD_DINING', 'PUBLIC_SPACE', 'OTHER']),
     instructions: z.string().trim().max(500, 'Instructions must be at most 500 characters.').optional(),
+    // Highest Rated acceptance mode (PRD_TRD_SUMMARY.md §5.6, backend Phase 4 item 4).
+    acceptanceMode: z.enum(['FIRST_ACCEPTED', 'HIGHEST_RATED']).default('FIRST_ACCEPTED'),
     requesterDeclaration: z.literal(true, {
       message: 'You must confirm the requester declaration before submitting.',
     }),
@@ -42,10 +53,23 @@ export const createRequestSchema = z
     message: 'scheduledAt is required for a SCHEDULED request.',
     path: ['scheduledAt'],
   })
-  .refine(data => data.type !== 'SCHEDULED' || (data.scheduledAt as Date) > new Date(), {
-    message: 'scheduledAt must be in the future.',
-    path: ['scheduledAt'],
-  });
+  .refine(
+    data =>
+      data.type !== 'SCHEDULED' ||
+      (data.scheduledAt as Date).getTime() >= Date.now() + REQUEST_SCHEDULED_MIN_LEAD_HOURS * 60 * 60 * 1000,
+    {
+      message: `A scheduled request must be at least ${REQUEST_SCHEDULED_MIN_LEAD_HOURS} hours ahead.`,
+      path: ['scheduledAt'],
+    },
+  )
+  .refine(
+    data =>
+      data.type !== 'SCHEDULED' || (data.scheduledAt as Date).getTime() <= Date.now() + 7 * 24 * 60 * 60 * 1000,
+    {
+      message: 'A scheduled request can be at most 7 days ahead.',
+      path: ['scheduledAt'],
+    },
+  );
 
 export const requestIdParamsSchema = z.object({
   id: z.string().min(1),
@@ -140,4 +164,9 @@ export const requestDetailsQuerySchema = z.object({
 export const acceptRequestSchema = z.object({
   latitude: z.number().min(-90).max(90),
   longitude: z.number().min(-180).max(180),
+});
+
+// Estimated Response Time (PRD_TRD_SUMMARY.md §3.3, §10 item 8).
+export const estimatedResponseTimeQuerySchema = z.object({
+  category: z.enum(['TRAFFIC', 'EVENTS', 'FOOD_DINING', 'PUBLIC_SPACE', 'OTHER']),
 });

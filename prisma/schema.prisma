@@ -8,34 +8,47 @@ datasource db {
 }
 
 model User {
-  id                 String               @id @default(uuid())
-  name               String
-  username           String               @unique
-  email              String               @unique
-  password           String
-  profileImage       String?
-  bio                String?
-  city               String?
-  latitude           Float?
-  longitude          Float?
-  locationUpdatedAt  DateTime?
-  availabilityStatus CreatorAvailability  @default(OFFLINE)
-  walletBalance      Decimal              @default(0.00) @db.Decimal(12, 2)
-  fcmToken           String?
-  isActive           Boolean              @default(true)
-  isSuspicious       Boolean              @default(false)
+  id                          String              @id @default(uuid())
+  name                        String
+  username                    String              @unique
+  email                       String              @unique
+  // Phone OTP auth (PRD §5.1 "OTP-based phone login (primary)"). Nullable + unique: email
+  // registration leaves this null (email remains the secondary path per PRD, unaffected by
+  // this addition); phone registration leaves `password` on the existing bcrypt-hashed random
+  // placeholder set at creation (see authService.registerViaPhone) since PhoneOtp is the only
+  // credential a phone-only account ever authenticates with.
+  phone                       String?             @unique
+  phoneVerifiedAt             DateTime?
+  password                    String
+  profileImage                String?
+  bio                         String?
+  city                        String?
+  latitude                    Float?
+  longitude                   Float?
+  locationUpdatedAt           DateTime?
+  availabilityStatus          CreatorAvailability @default(OFFLINE)
+  walletBalance               Decimal             @default(0.00) @db.Decimal(12, 2)
+  fcmToken                    String?
+  isActive                    Boolean             @default(true)
+  isSuspicious                Boolean             @default(false)
+  // Time-boxed Moderator/Admin suspension (PRD §5.9.2 "Suspend User button (reason +
+  // duration)") — distinct from the plain indefinite `isActive` block toggle above. Set
+  // alongside `isActive: false` at suspend time; `retentionJob`'s sweep auto-reactivates
+  // (`isActive: true`, this cleared to null) once it elapses. Null for an indefinite block or a
+  // never-suspended account — only ever non-null between a timed suspend and its expiry/lift.
+  suspendedUntil              DateTime?
   // Admin-controlled verification flag (backend Phase 10, Trust Profile "Verified Badge") —
   // no automated KYC/identity check exists yet (KYC fields are a separate, unbuilt Phase 13
   // item), so this is a manual Admin toggle only, mirroring isActive/isSuspicious.
-  isVerified         Boolean              @default(false)
+  isVerified                  Boolean             @default(false)
   // Notification Preferences (PRD §8.2, backend Phase 12) — 3 independently toggleable
   // categories. Safety-critical notifications (account suspension, payout rejection) are never
   // gated by these flags — enforced server-side in notificationService, not just hidden client-
   // side. Default true (opted-in) so existing users don't silently stop receiving notifications
   // this phase adds.
-  notifyRequestActivity Boolean           @default(true)
-  notifyPaymentWallet   Boolean           @default(true)
-  notifyPlatformAlerts  Boolean           @default(true)
+  notifyRequestActivity       Boolean             @default(true)
+  notifyPaymentWallet         Boolean             @default(true)
+  notifyPlatformAlerts        Boolean             @default(true)
   // Trust Profile change-detection snapshot (backend Phase 12) — lets notificationService fire
   // "Badge Earned"/"Trust Score Updated" only when something actually changed since the last
   // time this user's own profile was computed, without denormalizing the score/badges
@@ -43,45 +56,99 @@ model User {
   // only on `GET /trust-profile/me` (self-profile fetch), not on every read of this user's
   // profile by someone else — an interim decision, not a full event-driven recompute on every
   // score-affecting mutation (see docs/API.md "Notifications").
-  lastNotifiedTrustScore  Int?
-  lastNotifiedTrustBadges String[]        @default([])
+  lastNotifiedTrustScore      Int?
+  lastNotifiedTrustBadges     String[]            @default([])
   // Compliance & Data Management (PRD §9, §5.11b.3, backend Phase 13). `consecutiveRejections`
   // drives the welcome-video re-prompt (resets to 0 on any approved submission, or the moment
   // `welcomeVideoRepromptPending` is set — see requesterReviewService); mobile clears the flag
   // via `POST /account/welcome-video-ack` once it has shown the video again.
-  consecutiveRejections       Int       @default(0)
-  welcomeVideoRepromptPending Boolean   @default(false)
+  consecutiveRejections       Int                 @default(0)
+  welcomeVideoRepromptPending Boolean             @default(false)
+  // v2.1 mobile Phase 12 addition — previously no signal existed for "has this user ever seen
+  // the welcome video," only the re-prompt flag above (which starts false for a fresh signup,
+  // making it indistinguishable from "already seen and never rejected 3x"). Set once by the
+  // same `POST /account/welcome-video-ack` endpoint that already resets the re-prompt flag.
+  welcomeVideoSeenAt          DateTime?
   // Account Deletion workflow (soft delete now, hard delete once the grace period — a
   // ComplianceConfig-configurable `ACCOUNT_DELETION_GRACE_DAYS` — elapses; see
   // accountDeletionService/retentionJob). The account stays fully usable during the grace
   // window so the user can log back in and cancel; only `retentionJob.executeScheduledHardDeletes`
   // ever clears these two fields (to null, on cancel) or acts on them (at expiry).
-  deletionRequestedAt  DateTime?
-  deletionScheduledFor DateTime?
-  createdAt          DateTime             @default(now())
-  updatedAt          DateTime             @updatedAt
-  transactions       Transaction[]
-  payoutRequests     PayoutRequest[]
-  notifications      Notification[]
-  savedPlaces        SavedPlace[]
-  searchHistory      SearchHistoryEntry[]
-  requestsCreated    Request[]            @relation("RequesterRequests")
-  requestsFulfilled  Request[]            @relation("CreatorRequests")
-  chatMessages       ChatMessage[]
-  uploadedVideos     RequestVideo[]       @relation("CreatorUploadedVideos")
-  ratingsGiven       Rating[]             @relation("RatingsGiven")
-  ratingsReceived    Rating[]             @relation("RatingsReceived")
-  reportsFiled       Report[]             @relation("ReportsFiled")
-  reportsReceived    Report[]             @relation("ReportsReceived")
-  disputesRaised     Dispute[]            @relation("DisputesRaised")
-  disputeMessages    DisputeMessage[]     @relation("DisputeMessagesAuthoredByUser")
-  disputeEvidence    DisputeEvidence[]    @relation("DisputeEvidenceUploadedByUser")
-  consentRecords     ConsentRecord[]
-  dataExportRequests DataExportRequest[]
+  deletionRequestedAt         DateTime?
+  deletionScheduledFor        DateTime?
+
+  // --- v2.1 Beta Credits/Connects economy (backend Phase 1, schema-only — see
+  // locator-backend/docs/MASTER_EXECUTION_PLAN.md Phase 1 item 2 / Phase 2). Additive alongside
+  // the existing `walletBalance` (real-money INR, unchanged, still the only wallet field any
+  // service reads/writes until Phase 2 wires `ledgerService`). Spend order enforced by
+  // `ledgerService` once built: bonus -> purchased -> earned. `videoCredits` (earned+bonus+
+  // purchased) is computed at read time, never stored, per PRD_TRD_SUMMARY.md §4.3 — no column
+  // for it here on purpose.
+  earnedCredits             Int       @default(0)
+  bonusCredits              Int       @default(0)
+  purchasedCredits          Int       @default(0)
+  creatorConnects           Int       @default(0)
+  lastDailyConnectGrantDate DateTime? @db.Date
+
+  // v2.1 public-identity model (PRD_TRD_SUMMARY.md §10 item 1): `username` above is already the
+  // sole public identifier; `usernameChangedCount` enforces the "one change ever" rule (backend
+  // Phase 1 item 12 — not yet enforced in profileService, see Phase 8 item 8).
+  usernameChangedCount Int @default(0)
+
+  // v2.1 KYC/bank details (PRD_TRD_SUMMARY.md §4.2, backend Phase 1 item 11 / Phase 9). Required
+  // before first real-money withdrawal; not required for Beta launch. `bankAccountNumber` should
+  // be application-layer-encrypted (AES-256) before being written here once Phase 9 wires this —
+  // schema-only for now, no encryption/decryption code exists yet.
+  bankAccountNumber String?
+  bankIfsc          String?
+  kycStatus         KycStatus @default(NONE)
+
+  // Abandonment guard (PRD_TRD_SUMMARY.md §5.8 `abandonment_guard_evaluation`, backend Phase 8
+  // item 3) — set by `acceptanceTimerJob` when a Creator racks up 3 acceptance-timer expiries
+  // in a rolling 30 days; `requestService.accept` checks this before allowing a new Accept.
+  acceptanceBlockedUntil DateTime?
+  abandonmentEvents      AbandonmentEvent[]
+
+  createdAt                  DateTime                    @default(now())
+  updatedAt                  DateTime                    @updatedAt
+  transactions               Transaction[]
+  payoutRequests             PayoutRequest[]
+  notifications              Notification[]
+  savedPlaces                SavedPlace[]
+  searchHistory              SearchHistoryEntry[]
+  requestsCreated            Request[]                   @relation("RequesterRequests")
+  requestsFulfilled          Request[]                   @relation("CreatorRequests")
+  chatMessages               ChatMessage[]
+  uploadedVideos             RequestVideo[]              @relation("CreatorUploadedVideos")
+  ratingsGiven               Rating[]                    @relation("RatingsGiven")
+  ratingsReceived            Rating[]                    @relation("RatingsReceived")
+  reportsFiled               Report[]                    @relation("ReportsFiled")
+  reportsReceived            Report[]                    @relation("ReportsReceived")
+  disputesRaised             Dispute[]                   @relation("DisputesRaised")
+  disputeMessages            DisputeMessage[]            @relation("DisputeMessagesAuthoredByUser")
+  disputeEvidence            DisputeEvidence[]           @relation("DisputeEvidenceUploadedByUser")
+  consentRecords             ConsentRecord[]
+  dataExportRequests         DataExportRequest[]
+  refreshTokens              RefreshToken[]
+  ledgerEntries              LedgerEntry[]
+  preAcceptanceQueries       PreAcceptanceQuery[]
+  matchingWindowResponses    MatchingWindowResponse[]
+  postSubmissionChatMessages PostSubmissionChatMessage[]
+  tipsGiven                  Tip[]                       @relation("TipsGiven")
+  verifiedCreatorStatus      VerifiedCreatorStatus?
 
   @@index([email])
   @@index([username])
+  @@index([phone])
   @@index([availabilityStatus])
+}
+
+// v2.1 KYC tiers (PRD_TRD_SUMMARY.md §3.2). Full KYC (PAN/Aadhaar) triggered once cumulative
+// annual payout exceeds ₹50,000 — enforcement is a Phase 9 (real-money completion) item.
+enum KycStatus {
+  NONE
+  BASIC
+  FULL
 }
 
 // Creator's self-reported availability for discovery (PRD §5.5, §5.11). Only ONLINE
@@ -112,6 +179,10 @@ model Admin {
   email            String            @unique
   password         String
   name             String
+  // RBAC (PRD §5.13, TRD §5.4/§14) — Moderator is a capability of this same Admin JWT namespace,
+  // not a separate principal. Default ADMIN so every pre-existing seeded account keeps full
+  // access after this migration; new accounts are provisioned with an explicit role.
+  role             AdminRole         @default(ADMIN)
   fcmToken         String?
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
@@ -143,6 +214,58 @@ model AdminAuditLog {
   @@index([actorId])
   @@index([targetEntityType, targetEntityId])
   @@index([createdAt])
+}
+
+enum AdminRole {
+  MODERATOR
+  ADMIN
+}
+
+// Ledger reconciliation report (PRD §5.8 `ledger_reconciliation`, §5.14.5 "ledger reconciliation
+// report") — persists each nightly `ledgerReconciliationJob` run so an Admin can see results in
+// the panel, not just server logs. Not an `AdminAuditLog` row: this is a system-triggered sweep
+// with no Admin actor, and `AdminAuditLog.actorId` is required (a real Admin), not a system job.
+model LedgerReconciliationRun {
+  id            String   @id @default(uuid())
+  checkedCount  Int
+  varianceCount Int
+  variances     Json
+  createdAt     DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+// Live Monitoring alert feed (PRD §5.14.2 "Alert feed for flagged events (GPS spoofing,
+// high-value requests, blocked message attempts, repeated abandonment)") — additive alongside
+// the existing push-only `notificationService.notifyAdmins` calls at each trigger point (those
+// are unchanged; this makes the same signal queryable in the panel instead of push-only/ephemeral).
+model AdminAlert {
+  id        String   @id @default(uuid())
+  type      String
+  message   String
+  metadata  Json?
+  userId    String?
+  requestId String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([type])
+}
+
+// Notification Templates (PRD §5.14.9 "view/edit push notification template text incl. signup
+// welcome message; enable/disable specific triggers globally") — `type` matches a
+// `NotificationType` value (notificationTypes.ts), not FK-enforced since that's a code constant,
+// not a DB table. Additive: `notificationService.notifyUser`/`notifyAdmins` use a template's
+// title/body verbatim when present and `enabled`; otherwise fall back to the literal
+// title/body every existing call site already passes — no call site needed to change.
+model NotificationTemplate {
+  id        String   @id @default(uuid())
+  type      String   @unique
+  title     String
+  body      String
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 enum TransactionType {
@@ -229,6 +352,57 @@ model PasswordResetOtp {
   @@index([expiresAt])
 }
 
+// Phone OTP auth (PRD §5.1.1 "OTP-based phone login (primary)", §5.1.2, §10.1). One row per
+// phone number — request always overwrites the pending row for that phone (see
+// phoneOtpRepository.upsertForPhone), so there is never more than one live code per number.
+// Serves both registration (phone not yet a User) and login (phone already a User) through the
+// same table; authService decides which branch to take at verify time based on whether a User
+// with that phone already exists.
+enum PhoneOtpPurpose {
+  REGISTER
+  LOGIN
+}
+
+model PhoneOtp {
+  id          String          @id @default(uuid())
+  phone       String          @unique
+  purpose     PhoneOtpPurpose
+  otpHash     String
+  expiresAt   DateTime
+  attempts    Int             @default(0)
+  // PRD §5.1.2: "Maximum 3 failed attempts → 5-minute lockout." Distinct from the resend
+  // cooldown (`lastSentAt`) — a lockout blocks verification attempts, not new OTP requests,
+  // though authService also refuses to issue a fresh code while locked.
+  lockedUntil DateTime?
+  lastSentAt  DateTime        @default(now())
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@index([expiresAt])
+}
+
+// Refresh Token Rotation (PRD §5.1.1 "refresh token 30-day expiry", §11 "Security — Auth").
+// Opaque high-entropy tokens (not JWTs) — only `tokenHash` (SHA-256, deterministic so it can be
+// looked up directly, unlike bcrypt) is ever persisted; the raw token is returned to the client
+// exactly once, at issuance. Rotation-reuse detection: verifying a token that is already
+// `revokedAt` revokes the entire chain from `familyId` (see authService.rotateRefreshToken) —
+// signals the refresh token was stolen and replayed after the legitimate client already rotated.
+model RefreshToken {
+  id             String    @id @default(uuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id])
+  tokenHash      String    @unique
+  familyId       String
+  expiresAt      DateTime
+  revokedAt      DateTime?
+  replacedByHash String?
+  createdAt      DateTime  @default(now())
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+}
+
 model SavedPlace {
   id        String   @id @default(uuid())
   userId    String
@@ -309,7 +483,12 @@ enum LocationCategory {
   PROHIBITED
 }
 
-// Exact 15-state enum per PRD §5.13. Do not add convenience states.
+// v2.0-era 15-state enum (PRD §5.13 pre-v2.1). Kept as-is for now — TEMPORARY_CHAT and this
+// exact transition set are SUPERSEDED by PRD_TRD_SUMMARY.md §5.6 (v2.1) and must migrate in
+// backend Phase 3 (state machine rewrite + data migration of existing rows), not here. This
+// schema-only pass (Phase 1) only ADDS the new v2.1 states below so the column can hold them
+// once Phase 3's state machine starts emitting them; it does not remove/rename anything or
+// touch requestStateMachine.ts. See docs/CLAUDE.md §2.8/§10 item 5 for the full migration note.
 enum RequestStatus {
   DRAFT
   PUBLISHED
@@ -327,6 +506,28 @@ enum RequestStatus {
   DISPUTED
   EXPIRED
   CANCELLED
+  // --- v2.1 additions (PRD_TRD_SUMMARY.md §5.6) — not yet emitted by requestStateMachine.ts;
+  // Phase 3 wires these in and retires TEMPORARY_CHAT.
+  PENDING_MODERATION
+  MATCHING_WINDOW
+  TIPPING
+}
+
+// v2.1 Acceptance Mode (PRD_TRD_SUMMARY.md §3.4, §7.5, new in v2.1). Defaults to
+// FIRST_ACCEPTED so every existing/new request behaves exactly as today until Phase 4 wires
+// HIGHEST_RATED's matching-window flow.
+enum AcceptanceMode {
+  FIRST_ACCEPTED
+  HIGHEST_RATED
+}
+
+// v2.1 Beta vs. real-money economy (PRD_TRD_SUMMARY.md §1, §4.5). Snapshot of the platform's
+// `ENABLE_REAL_MONEY` flag at request-creation time so an in-flight request is never
+// retroactively affected by a later mode switch. Defaults to INR to match this codebase's
+// current real-money-only behavior until Phase 2 makes CREDIT mode selectable.
+enum RequestCurrencyMode {
+  CREDIT
+  INR
 }
 
 model Request {
@@ -357,6 +558,21 @@ model Request {
   reshootCount            Int           @default(0)
   chatFlaggedForReview    Boolean       @default(false)
 
+  // v2.1 additions (backend Phase 1 item 4; Highest Rated fully wired backend Phase 4 item 4 —
+  // see matchingWindowService.ts).
+  acceptanceMode    AcceptanceMode          @default(FIRST_ACCEPTED)
+  currencyMode      RequestCurrencyMode     @default(INR)
+  settingsVersionId String?
+  settingsVersion   PlatformSettingVersion? @relation(fields: [settingsVersionId], references: [id])
+
+  // Highest Rated matching window (backend Phase 4 item 4) — set when a HIGHEST_RATED request
+  // enters MATCHING_WINDOW status at publish; `matchingWindowJob`'s sweep closes any request
+  // whose window has elapsed, choosing the Bayesian-adjusted-highest-rated respondent (or
+  // falling back to FIRST_ACCEPTED/PUBLISHED if nobody responded). Cleared (null) once the
+  // window closes either way. (See `matchingWindowResponses` relation further below — already
+  // declared on this model.)
+  matchingWindowClosesAt DateTime?
+
   // Trust Profile support (backend Phase 10). `creatorId` gets nulled by the acceptance-timer
   // sweep when a Creator never starts recording in time (see acceptanceTimerJob) — that's
   // correct for matching/discovery, but it erases the Creator's fulfilment history from
@@ -368,20 +584,25 @@ model Request {
   lastAssignedCreatorId String?
   creatorTimedOut       Boolean @default(false)
 
-  requesterDeclarationAt   DateTime
-  creatorDeclarationAt     DateTime?
-  acceptedAt               DateTime?
-  acceptanceTimerExpiresAt DateTime?
-  recordingStartedAt       DateTime?
-  uploadedAt               DateTime?
-  moderatorDecisionAt      DateTime?
-  moderatorRejectionReason String?
-  requesterDecisionAt      DateTime?
-  requesterReviewRemarks   String?
-  requesterRejectionReason String?
-  reshootReason            String?
-  cancelledAt              DateTime?
-  cancellationReason       String?
+  requesterDeclarationAt    DateTime
+  creatorDeclarationAt      DateTime?
+  acceptedAt                DateTime?
+  acceptanceTimerExpiresAt  DateTime?
+  recordingStartedAt        DateTime?
+  uploadedAt                DateTime?
+  moderatorDecisionAt       DateTime?
+  moderatorRejectionReason  String?
+  // Pre-publish Moderation Queue (PRD §5.9.2, §5.14.7) — distinct from `moderatorRejectionReason`
+  // above, which is stamped by the *video* moderation flow onto this same Request row. This one
+  // is set only when a still-DRAFT/PENDING_MODERATION request itself (not yet published, no
+  // video exists yet) is rejected before ever reaching Creators.
+  prePublishRejectionReason String?
+  requesterDecisionAt       DateTime?
+  requesterReviewRemarks    String?
+  requesterRejectionReason  String?
+  reshootReason             String?
+  cancelledAt               DateTime?
+  cancellationReason        String?
 
   // Notification reminder sweep bookkeeping (backend Phase 12, notificationReminderJob) — each
   // is stamped once a reminder actually fires, so the sweep never re-notifies for the same
@@ -389,19 +610,29 @@ model Request {
   recordingReminderSentAt DateTime?
   reviewReminderSentAt    DateTime?
   ratingReminderSentAt    DateTime?
+  // v2.1 48h Requester Review auto-accept (PRD_TRD_SUMMARY.md §5.8 `requester_review_auto_accept`,
+  // backend Phase 3 item 5) — 42h warning push, gated on this so the sweep never re-warns. No
+  // separate "auto-accepted" flag is needed: once auto-accepted the status leaves
+  // REQUESTER_REVIEW entirely, which already excludes the row from the sweep's query.
+  autoAcceptWarningSentAt DateTime?
 
   expiresAt DateTime
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  chatMessages ChatMessage[]
-  videos       RequestVideo[]
-  transactions Transaction[]
-  escrow       RequestEscrow?
-  ratings      Rating[]
-  reports      Report[]
-  dispute      Dispute?
-  consentRecords ConsentRecord[]
+  chatMessages               ChatMessage[]
+  videos                     RequestVideo[]
+  transactions               Transaction[]
+  escrow                     RequestEscrow?
+  ratings                    Rating[]
+  reports                    Report[]
+  dispute                    Dispute?
+  consentRecords             ConsentRecord[]
+  ledgerEntries              LedgerEntry[]
+  preAcceptanceQueries       PreAcceptanceQuery[]
+  matchingWindowResponses    MatchingWindowResponse[]
+  postSubmissionChatMessages PostSubmissionChatMessage[]
+  tip                        Tip?
 
   @@index([requesterId])
   @@index([creatorId])
@@ -427,16 +658,28 @@ enum EscrowState {
   SPLIT
 }
 
+// v2.1 currency-aware escrow (PRD_TRD_SUMMARY.md §4.5, backend Phase 2 item 5). Defaults to INR
+// so every existing row (and every row created before this item's escrowService changes land)
+// keeps its current real-money meaning unchanged. `amountLocked`/`commissionAmount`/
+// `creatorEarnings` are Credits (whole units) when CREDIT, rupees when INR — same columns, unit
+// determined by this field, per the plan's "same hold/release/split state machine serves both
+// modes" recommendation (avoids duplicating the RESERVED|RELEASED|REFUNDED|FROZEN|SPLIT machinery).
+enum EscrowCurrency {
+  CREDIT
+  INR
+}
+
 model RequestEscrow {
   id        String  @id @default(uuid())
   requestId String  @unique
   request   Request @relation(fields: [requestId], references: [id])
 
-  amountLocked     Decimal  @db.Decimal(12, 2)
-  commissionRate   Decimal  @db.Decimal(5, 2)
-  commissionAmount Decimal  @db.Decimal(12, 2)
-  creatorEarnings  Decimal  @db.Decimal(12, 2)
-  refundAmount     Decimal? @db.Decimal(12, 2)
+  currency         EscrowCurrency @default(INR)
+  amountLocked     Decimal        @db.Decimal(12, 2)
+  commissionRate   Decimal        @db.Decimal(5, 2)
+  commissionAmount Decimal        @db.Decimal(12, 2)
+  creatorEarnings  Decimal        @db.Decimal(12, 2)
+  refundAmount     Decimal?       @db.Decimal(12, 2)
 
   state      EscrowState @default(RESERVED)
   reservedAt DateTime    @default(now())
@@ -578,6 +821,12 @@ model Rating {
   stars      Int
   reviewText String?
   createdAt  DateTime   @default(now())
+
+  // v2.1 double-blind reveal (PRD_TRD_SUMMARY.md §4.11, backend Phase 8 item 7): the later of
+  // "both sides submitted" or "createdAt + 7 days". Nullable/unset until Phase 8 wires the
+  // computation — no service reads this yet, so both ratings remain visible unconditionally
+  // (today's actual behavior) until that phase lands.
+  visibleAt DateTime?
 
   @@unique([requestId, raterId])
   @@index([rateeId])
@@ -856,15 +1105,242 @@ enum DeletionLogAction {
 }
 
 model DataDeletionLog {
-  id         String             @id @default(uuid())
+  id         String            @id @default(uuid())
   userId     String?
   action     DeletionLogAction
   entityType String
   entityId   String?
   metadata   Json?
-  createdAt  DateTime           @default(now())
+  createdAt  DateTime          @default(now())
 
   @@index([userId])
   @@index([action])
   @@index([createdAt])
+}
+
+// =============================================================================================
+// v2.1 additions (backend Phase 1, schema-only). Nothing below is read/written by any service
+// yet — see locator-backend/docs/MASTER_EXECUTION_PLAN.md Phases 2-7 for the services that wire
+// each of these in, and docs/CLAUDE.md for the file-cited gap this closes.
+// =============================================================================================
+
+// --- Feature Flags / Economy Settings (PRD_TRD_SUMMARY.md §4.15, §6.1 item 11, backend Phase 6) --
+// `platformSettings` is the source of truth; every write also inserts an immutable
+// `PlatformSettingVersion` row. `Request.settingsVersionId` (and, once Phase 2 lands,
+// `LedgerEntry.settingsVersionId`) pin the version in force at creation time so a later Admin
+// change never retroactively affects an in-flight request — the same snapshot discipline
+// `RequestEscrow.commissionRate` already proves out for the one setting (commission) that exists
+// today.
+model PlatformSetting {
+  key              String   @id
+  value            Json
+  updatedAt        DateTime @updatedAt
+  updatedByAdminId String?
+
+  @@index([updatedAt])
+}
+
+model PlatformSettingVersion {
+  id               String   @id @default(uuid())
+  key              String
+  oldValue         Json?
+  newValue         Json
+  changedByAdminId String?
+  reason           String?
+  createdAt        DateTime @default(now())
+
+  requests Request[]
+
+  @@index([key, createdAt])
+}
+
+// --- Beta Credits/Connects ledger (PRD_TRD_SUMMARY.md §4.4, backend Phase 2) -------------------
+// Append-only. No update/delete code path should ever be written against this model — every
+// balance change is a new row; balances are derived (`SUM` per user/currency), never stored
+// authoritatively anywhere. `balanceAfter` is a convenience snapshot only, not the source of
+// truth (PRD_TRD_SUMMARY.md §4.4's explicit "not authoritative" note).
+enum LedgerCurrency {
+  CREDIT
+  CONNECT
+  INR
+}
+
+enum LedgerDirection {
+  DEBIT
+  CREDIT
+}
+
+enum LedgerReasonCode {
+  SIGNUP_BONUS
+  DAILY_CONNECT_BONUS
+  REQUEST_HOLD
+  REQUEST_REFUND
+  ACCEPT_SPEND
+  ACCEPT_REFUND
+  CREATOR_REWARD
+  TIP_SENT
+  TIP_RECEIVED
+  ADMIN_ADJUSTMENT
+  COMMISSION_DEDUCTION
+  PAYOUT
+  TOP_UP
+}
+
+model LedgerEntry {
+  id                String           @id @default(uuid())
+  userId            String
+  user              User             @relation(fields: [userId], references: [id])
+  currency          LedgerCurrency
+  direction         LedgerDirection
+  amount            Int
+  balanceAfter      Int?
+  reasonCode        LedgerReasonCode
+  requestId         String?
+  request           Request?         @relation(fields: [requestId], references: [id])
+  actorId           String?
+  settingsVersionId String?
+  idempotencyKey    String?          @unique
+  createdAt         DateTime         @default(now())
+
+  @@index([userId, currency, createdAt])
+  @@index([requestId])
+  @@index([reasonCode])
+}
+
+// --- Pre-Acceptance Query (PRD_TRD_SUMMARY.md §4.6, backend Phase 4) ---------------------------
+// Replaces the v2.0 post-acceptance `ChatMessage`/`TEMPORARY_CHAT` flow (see docs/CLAUDE.md §2.2).
+// One thread per Creator per Request — mutually invisible to other Creators — capped at 3
+// exchanges of <=200 chars each. Does not lock the request or touch the mutex.
+enum PreAcceptanceQueryStatus {
+  OPEN
+  CLOSED_DECLINED
+  CLOSED_ACCEPTED
+  CLOSED_EXPIRED
+}
+
+model PreAcceptanceQuery {
+  id            String                   @id @default(uuid())
+  requestId     String
+  request       Request                  @relation(fields: [requestId], references: [id])
+  creatorId     String
+  creator       User                     @relation(fields: [creatorId], references: [id])
+  exchangeCount Int                      @default(0)
+  status        PreAcceptanceQueryStatus @default(OPEN)
+  createdAt     DateTime                 @default(now())
+  updatedAt     DateTime                 @updatedAt
+
+  messages PreAcceptanceQueryMessage[]
+
+  @@unique([requestId, creatorId])
+  @@index([requestId])
+  @@index([creatorId])
+}
+
+model PreAcceptanceQueryMessage {
+  id        String             @id @default(uuid())
+  queryId   String
+  query     PreAcceptanceQuery @relation(fields: [queryId], references: [id])
+  senderId  String
+  body      String
+  blocked   Boolean            @default(false)
+  createdAt DateTime           @default(now())
+
+  @@index([queryId, createdAt])
+}
+
+// --- Highest Rated Creator matching window (PRD_TRD_SUMMARY.md §4.7, TRD 7.2.1/8.2, backend
+// Phase 4) --- A "reservation" during the 90s window must NOT write to LedgerEntry — this table
+// is the Redis-sorted-set response's Postgres-side durable record, written at window-close only
+// for bookkeeping/audit, not as the spend mechanism itself (the winner's actual Connect spend is
+// a LedgerEntry row written by ledgerService at close, per TRD 7.2.1 — do not write N ledger rows
+// for N respondents).
+enum MatchingWindowReservationStatus {
+  RESERVED
+  SPENT
+  RELEASED
+}
+
+model MatchingWindowResponse {
+  id                       String                          @id @default(uuid())
+  requestId                String
+  request                  Request                         @relation(fields: [requestId], references: [id])
+  creatorId                String
+  creator                  User                            @relation(fields: [creatorId], references: [id])
+  respondedAt              DateTime                        @default(now())
+  connectReservationStatus MatchingWindowReservationStatus @default(RESERVED)
+  distanceMetres           Int?
+
+  @@unique([requestId, creatorId])
+  @@index([requestId])
+}
+
+// --- Post-Submission Chat (PRD_TRD_SUMMARY.md §4.10, backend Phase 4/5) ------------------------
+// Only reachable when the Moderation Toggle is OFF (Phase 5) — a separate, informal chat on the
+// video-review screen. Deliberately a separate table from `ChatMessage`/`PreAcceptanceQuery` so
+// existing `ChatMessage` rows (evidence tied to the retiring `TEMPORARY_CHAT` state) are never
+// reinterpreted (docs/CLAUDE.md §2.2, Phase 1 item 7).
+model PostSubmissionChatMessage {
+  id             String   @id @default(uuid())
+  requestId      String
+  request        Request  @relation(fields: [requestId], references: [id])
+  senderId       String
+  sender         User     @relation(fields: [senderId], references: [id])
+  body           String
+  blockedAttempt Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  @@index([requestId, createdAt])
+}
+
+// --- Tipping (PRD_TRD_SUMMARY.md §3.3, §4.13, backend Phase 2 item 6) --------------------------
+// 10-500 Credits or INR10-500 depending on the request's currencyMode; 100% to Creator, zero
+// commission in any mode; 7-day window post-Completed. One tip per request (`@@unique` below,
+// matching the PRD's single-tip flow — no repeated tipping on the same request).
+model Tip {
+  id              String   @id @default(uuid())
+  requestId       String   @unique
+  request         Request  @relation(fields: [requestId], references: [id])
+  fromUserId      String
+  fromUser        User     @relation("TipsGiven", fields: [fromUserId], references: [id])
+  amount          Int
+  sourceBreakdown Json?
+  createdAt       DateTime @default(now())
+}
+
+// --- Verified Creator Badge automation (PRD_TRD_SUMMARY.md §3.5, §4.12, backend Phase 7) -------
+// Replaces `User.isVerified`'s manual-Admin-toggle-only semantics with auto-award/auto-revoke/
+// auto-reinstate (see docs/CLAUDE.md §2.7). `User.isVerified` is left as-is in this schema-only
+// pass — Phase 7 decides how the two fields reconcile (likely: this table becomes the source of
+// truth, `isVerified` becomes a read-through convenience or is deprecated).
+enum VerifiedCreatorRevokedReason {
+  SUSPENSION
+  LOW_RATING
+  ADMIN_MANUAL
+}
+
+model VerifiedCreatorStatus {
+  id              String                        @id @default(uuid())
+  userId          String                        @unique
+  user            User                          @relation(fields: [userId], references: [id])
+  completedCount  Int                           @default(0)
+  isVerified      Boolean                       @default(false)
+  revokedReason   VerifiedCreatorRevokedReason?
+  lastEvaluatedAt DateTime?
+  createdAt       DateTime                      @default(now())
+  updatedAt       DateTime                      @updatedAt
+}
+
+// Abandonment guard (PRD_TRD_SUMMARY.md §5.8 `abandonment_guard_evaluation`, backend Phase 8
+// item 3) — one row per acceptance-timer expiry (a Creator who accepted but never started
+// recording in time). 3 events in a rolling 30 days trips a 24h accept-block
+// (`User.acceptanceBlockedUntil`), evaluated event-driven from `acceptanceTimerJob` at the
+// moment of the 3rd (or later) expiry, per TRD 9 — not a separate scheduled sweep.
+model AbandonmentEvent {
+  id        String   @id @default(uuid())
+  creatorId String
+  creator   User     @relation(fields: [creatorId], references: [id])
+  requestId String
+  createdAt DateTime @default(now())
+
+  @@index([creatorId, createdAt])
 }

@@ -1,8 +1,10 @@
 import {requestRepository} from '../repositories/requestRepository';
 import {requestVideoRepository} from '../repositories/requestVideoRepository';
 import {consentService} from './consentService';
+import {gpsSpoofingService} from './gpsSpoofingService';
 import {notificationService} from './notificationService';
 import {NotificationType} from './notificationTypes';
+import {settingsService} from './settingsService';
 import {videoStorageProvider} from './storage';
 import {HttpError} from '../utils/httpError';
 import {presentRequest} from '../utils/requestPresenter';
@@ -38,15 +40,20 @@ async function loadOwnedVideo(creatorId: string, requestId: string, videoId: str
 }
 
 export const recordingService = {
-  /** `POST /requests/:id/recording/start` (PRD §5.6 item 1) — closes chat, opens Recording. */
+  /**
+   * `POST /requests/:id/recording/start` (PRD §5.6 item 1) — opens Recording. v2.1 (backend
+   * Phase 4 item 2): CREATOR_ASSIGNED is now the resting state a Creator starts recording
+   * from directly (TEMPORARY_CHAT retired from the accept flow) — TEMPORARY_CHAT is still
+   * accepted here too so any pre-existing row from before this change can still proceed.
+   */
   async startRecording(creatorId: string, requestId: string) {
     const request = await loadOwnedRequest(creatorId, requestId);
 
-    if (request.status !== 'TEMPORARY_CHAT') {
-      throw new HttpError(409, 'Recording can only start while chat is open for this request.');
+    if (request.status !== 'CREATOR_ASSIGNED' && request.status !== 'TEMPORARY_CHAT') {
+      throw new HttpError(409, 'Recording can only start once you have been assigned this request.');
     }
 
-    assertTransition('TEMPORARY_CHAT', 'RECORDING');
+    assertTransition(request.status, 'RECORDING');
     const now = new Date();
     const updated = await requestRepository.update(requestId, {
       status: 'RECORDING',
@@ -149,6 +156,9 @@ export const recordingService = {
       throw new HttpError(422, 'Recording is too long for the selected duration.');
     }
 
+    // GPS spoofing signal (backend Phase 8 item 2) — flag-and-queue only, never blocks upload.
+    gpsSpoofingService.checkAndFlag(creatorId, metadata.gpsLatitude, metadata.gpsLongitude, 'recording_upload').catch(() => {});
+
     await requestVideoRepository.update(videoId, {
       status: 'UPLOADING',
       uploadAttempts: {increment: 1},
@@ -212,17 +222,42 @@ export const recordingService = {
     });
 
     assertTransition('RECORDING', 'UPLOAD');
-    assertTransition('UPLOAD', 'MODERATOR_REVIEW');
     await requestRepository.update(requestId, {status: 'UPLOAD', uploadedAt: new Date()});
-    const updatedRequest = await requestRepository.update(requestId, {status: 'MODERATOR_REVIEW'});
+
+    // v2.1 Moderation Toggle (PRD_TRD_SUMMARY.md §3.5/§5.6, backend Phase 5) — ON (default)
+    // routes through the moderator queue as before; OFF skips straight to Requester Review.
+    // Safety enforcement (reports/suspension/disputes) is never gated by this toggle — it only
+    // ever affects this one transition.
+    const moderationEnabled = await settingsService.isModerationEnabled();
+    const nextStatus = moderationEnabled ? 'MODERATOR_REVIEW' : 'REQUESTER_REVIEW';
+    assertTransition('UPLOAD', nextStatus);
+    const updatedRequest = await requestRepository.update(requestId, {
+      status: nextStatus,
+      // Moderation-OFF path has no Moderator decision at all — stamp moderatorDecisionAt here
+      // too so the existing review-reminder/auto-accept sweeps (which key off this timestamp,
+      // see notificationReminderJob/requesterReviewAutoAcceptJob) still find these requests.
+      ...(nextStatus === 'REQUESTER_REVIEW' ? {moderatorDecisionAt: new Date()} : {}),
+    });
 
     await notificationService.notifyUser(
       creatorId,
       NotificationType.UPLOAD_SUCCESSFUL,
       'Upload successful',
-      'Your video was uploaded successfully and is now awaiting moderation review.',
+      moderationEnabled
+        ? 'Your video was uploaded successfully and is now awaiting moderation review.'
+        : 'Your video was uploaded successfully and is now awaiting Requester review.',
       {requestId, videoId, screen: 'CreatorRequestDetail'},
     );
+
+    if (!moderationEnabled) {
+      await notificationService.notifyUser(
+        updatedRequest.requesterId,
+        NotificationType.VIDEO_READY,
+        'Video Ready for Review',
+        'Your requested video is ready for your review.',
+        {requestId, screen: 'VideoReview'},
+      );
+    }
 
     return {request: presentRequest(updatedRequest), video: presentRequestVideo(updatedVideo)};
   },
@@ -298,7 +333,13 @@ export const recordingService = {
     );
   },
 
-  /** `DELETE /requests/:id/video/:videoId` — delete an uploaded draft, reverting to RECORDING. */
+  /**
+   * `DELETE /requests/:id/video/:videoId` — delete an uploaded draft, reverting to RECORDING.
+   * Known gap (backend Phase 5, not fixed here): on the Moderation-OFF path a request skips
+   * straight to REQUESTER_REVIEW, so a Creator cannot withdraw a draft during that window the
+   * way they can on the Moderation-ON path (MODERATOR_REVIEW). Narrow edge case, only reachable
+   * once an Admin actually disables moderation — flagged rather than silently left unhandled.
+   */
   async deleteDraft(creatorId: string, requestId: string, videoId: string) {
     const request = await loadOwnedRequest(creatorId, requestId);
     const video = await loadOwnedVideo(creatorId, requestId, videoId);

@@ -4,6 +4,10 @@ import {HttpError} from '../utils/httpError';
 import {presentRating, presentRatingSummary, RatingSummary} from '../utils/ratingPresenter';
 import {notificationService} from './notificationService';
 import {NotificationType} from './notificationTypes';
+import {verifiedCreatorService} from './verifiedCreatorService';
+
+/** Double-blind reveal window (PRD_TRD_SUMMARY.md §4.11, backend Phase 8 item 7) — a rating becomes visible at the later of "both sides submitted" or this many days after submission. */
+const DOUBLE_BLIND_WINDOW_DAYS = 7;
 
 /** Mutual Ratings (PRD §5.12, §4.6 "Rate your experience", backend Phase 9). */
 export const ratingService = {
@@ -40,6 +44,17 @@ export const ratingService = {
       throw new HttpError(409, 'You have already rated this request.');
     }
 
+    // Double-blind reveal (PRD_TRD_SUMMARY.md §4.11, backend Phase 8 item 7): the OTHER
+    // direction's rating (if it already exists) was created with `visibleAt` set to its
+    // +7-day fallback — now that both sides have submitted, reveal both immediately by
+    // bringing that fallback forward to now. This new rating starts with the same +7-day
+    // fallback in case it's the first of the pair.
+    const now = new Date();
+    const otherDirectionRaterId = role === 'REQUESTER_RATES_CREATOR' ? request.creatorId : request.requesterId;
+    const otherRating = otherDirectionRaterId
+      ? await ratingRepository.findByRequestAndRater(requestId, otherDirectionRaterId)
+      : null;
+
     const rating = await ratingRepository.create({
       request: {connect: {id: requestId}},
       rater: {connect: {id: userId}},
@@ -47,7 +62,12 @@ export const ratingService = {
       role,
       stars,
       reviewText: comment ?? null,
+      visibleAt: otherRating ? now : new Date(now.getTime() + DOUBLE_BLIND_WINDOW_DAYS * 24 * 60 * 60 * 1000),
     });
+
+    if (otherRating) {
+      await ratingRepository.update(otherRating.id, {visibleAt: now});
+    }
 
     await notificationService.notifyUser(
       rateeId,
@@ -56,6 +76,17 @@ export const ratingService = {
       `You received a ${stars}-star rating.`,
       {requestId, stars: String(stars), screen: 'RequestDetail'},
     );
+
+    // Verified Creator Badge re-evaluation (PRD_TRD_SUMMARY.md §4.12, backend Phase 7) —
+    // event-driven "on every ... new rating" per TRD 9. Only a Requester's rating of a Creator
+    // affects the badge (Creator ratings of Requesters don't feed this).
+    if (role === 'REQUESTER_RATES_CREATOR') {
+      try {
+        await verifiedCreatorService.evaluate(rateeId);
+      } catch {
+        // Best-effort — the next rating or Completed transition will re-evaluate anyway.
+      }
+    }
 
     return presentRating(rating);
   },
@@ -71,7 +102,12 @@ export const ratingService = {
     }
 
     const ratings = await ratingRepository.findByRequestId(requestId);
-    return ratings.map(presentRating);
+    const now = new Date();
+    // Double-blind reveal: a rating is visible if the caller wrote it themselves (you can
+    // always see your own submission), or its `visibleAt` (later of both-submitted / +7 days)
+    // has passed.
+    const visible = ratings.filter(r => r.raterId === userId || (r.visibleAt !== null && r.visibleAt <= now));
+    return visible.map(presentRating);
   },
 
   /** Average/count for a user, computed on demand — no denormalized field on `User`. */

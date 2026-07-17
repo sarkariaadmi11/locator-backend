@@ -15,6 +15,10 @@ export const userRepository = {
     return prisma.user.findUnique({where: {username}});
   },
 
+  findByPhone(phone: string) {
+    return prisma.user.findUnique({where: {phone}});
+  },
+
   findById(id: string) {
     return prisma.user.findUnique({where: {id}});
   },
@@ -58,6 +62,18 @@ export const userRepository = {
     });
   },
 
+  /** Time-boxed Suspend User (PRD §5.9.2) auto-reactivation sweep — see `retentionJob`. */
+  findExpiredSuspensions(now: Date) {
+    return prisma.user.findMany({
+      where: {isActive: false, suspendedUntil: {lte: now}},
+      select: {id: true},
+    });
+  },
+
+  reactivateExpiredSuspension(id: string) {
+    return prisma.user.update({where: {id}, data: {isActive: true, suspendedUntil: null}});
+  },
+
   /**
    * Irreversible PII anonymization (not a literal row delete — see `accountDeletionService`'s
    * file-level comment for why). `email`/`username` are still `@unique`, so they're replaced
@@ -70,6 +86,8 @@ export const userRepository = {
         name: 'Deleted User',
         username: `deleted-${id}`,
         email: `deleted-${id}@deleted.locator`,
+        phone: null,
+        phoneVerifiedAt: null,
         password: '',
         profileImage: null,
         bio: null,

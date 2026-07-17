@@ -6,15 +6,20 @@ import {logger} from '../config/logger';
 import {disputeRepository} from '../repositories/disputeRepository';
 import {requestEscrowRepository} from '../repositories/requestEscrowRepository';
 import {requestRepository} from '../repositories/requestRepository';
+import {requestVideoRepository} from '../repositories/requestVideoRepository';
 import {transactionRepository} from '../repositories/transactionRepository';
 import {HttpError} from '../utils/httpError';
+import {buildGpsCheck} from '../utils/geo';
 import {presentDispute, presentDisputeDetail} from '../utils/disputePresenter';
+import {presentRequestVideo} from '../utils/requestVideoPresenter';
 import {DISPUTE_ALLOWED_SOURCE_STATUSES} from '../validations/disputeValidation';
 import {REQUEST_HIGH_VALUE_THRESHOLD as LARGE_REFUND_THRESHOLD} from '../validations/requestValidation';
 import {adminAuditLogService} from './adminAuditLogService';
 import {escrowService} from './escrowService';
 import {notificationService} from './notificationService';
 import {NotificationType} from './notificationTypes';
+import {postSubmissionChatService} from './postSubmissionChatService';
+import {queryService} from './queryService';
 import {assertTransition} from './requestStateMachine';
 import {round2} from '../utils/money';
 
@@ -125,6 +130,72 @@ export const disputeService = {
       `A ${raisedByRole.toLowerCase()} raised a dispute (${input.reason}).`,
       {requestId: input.requestId, disputeId: created.id},
     );
+
+    return presentDispute(created);
+  },
+
+  /**
+   * `POST /admin/moderation/videos/:videoId/escalate` — Admin/Moderator "Escalate to Dispute
+   * Center" (PRD §5.14.7, admin frontend Phase 3, backend Phase 5 item 6). Unlike `create()`
+   * above, the caller is staff, not a participant — `Dispute.raisedById` is a hard FK to `User`
+   * (no `Admin` variant), so this attributes the case to the request's Requester with
+   * `raisedByRole: 'ADMIN'` (an existing enum value, previously unused) to correctly mark it as
+   * staff-initiated, not a Requester self-service dispute. The escalating Admin is set as
+   * `caseOwnerAdmin` immediately, skipping the normal manual "assign" step.
+   */
+  async adminEscalate(adminId: string, requestId: string, input: {reason: DisputeReason; description: string}) {
+    const request = await requestRepository.findById(requestId);
+    if (!request) {
+      throw new HttpError(404, 'Request not found.');
+    }
+
+    if (!(DISPUTE_ALLOWED_SOURCE_STATUSES as readonly string[]).includes(request.status)) {
+      throw new HttpError(409, `A dispute cannot be raised while this request is ${request.status}.`);
+    }
+
+    const existing = await disputeRepository.findByRequestId(requestId);
+    if (existing) {
+      throw new HttpError(409, 'A dispute has already been raised for this request.');
+    }
+
+    const escrow = await requestEscrowRepository.findByRequestId(requestId);
+    if (!escrow) {
+      throw new HttpError(404, 'No escrow exists for this request.');
+    }
+
+    assertTransition(request.status, 'DISPUTED');
+
+    const created = await disputeRepository.create({
+      request: {connect: {id: requestId}},
+      raisedBy: {connect: {id: request.requesterId}},
+      raisedByRole: 'ADMIN',
+      reason: input.reason,
+      description: input.description,
+      amountLocked: escrow.amountLocked,
+      commissionRate: escrow.commissionRate,
+      escrowStateAtCreation: escrow.state,
+      alreadyReleasedToCreator: escrow.state === 'RELEASED' ? escrow.creatorEarnings : 0,
+      alreadyRefundedToRequester: escrow.state === 'REFUNDED' ? escrow.amountLocked : 0,
+      caseOwnerAdmin: {connect: {id: adminId}},
+    });
+
+    await escrowService.freeze(requestId);
+    await requestRepository.update(requestId, {status: 'DISPUTED'});
+    await adminAuditLogService.log(adminId, 'MODERATION_ESCALATED_TO_DISPUTE', 'Request', requestId, {
+      disputeId: created.id,
+      reason: input.reason,
+    });
+
+    for (const partyId of [request.requesterId, request.creatorId]) {
+      if (!partyId) continue;
+      await notificationService.notifyUser(
+        partyId,
+        NotificationType.DISPUTE_CREATED,
+        'Dispute Raised',
+        'Our moderation team has escalated your request to the Dispute Center for review.',
+        {requestId, disputeId: created.id, screen: 'DisputeDetail'},
+      );
+    }
 
     return presentDispute(created);
   },
@@ -296,11 +367,31 @@ export const disputeService = {
     };
   },
 
-  /** Case Detail + Evidence Viewer + Escrow Status — full detail, internal notes included. */
+  /**
+   * Case Detail + Evidence Viewer + Escrow Status — full detail, internal notes included.
+   * PRD §5.14.6 "views video, query threads, post-submission chat, GPS data, both parties'
+   * input" — the base `presentDisputeDetail` already covers messages/evidence/both parties;
+   * this adds the remaining four via the same admin-bypass pattern used elsewhere
+   * (`queryService.adminList`/`postSubmissionChatService.adminList` skip the participant check
+   * a normal user-facing call would enforce).
+   */
   async adminDetail(disputeId: string) {
     const dispute = await loadDisputeDetailOr404(disputeId);
-    const escrow = await requestEscrowRepository.findByRequestId(dispute.requestId);
-    return {...presentDisputeDetail(dispute, true), escrow};
+    const [escrow, video, queryThreads, postSubmissionChat] = await Promise.all([
+      requestEscrowRepository.findByRequestId(dispute.requestId),
+      requestVideoRepository.findActiveByRequestId(dispute.requestId),
+      queryService.adminList(dispute.requestId),
+      postSubmissionChatService.adminList(dispute.requestId),
+    ]);
+
+    return {
+      ...presentDisputeDetail(dispute, true),
+      escrow,
+      video: video ? presentRequestVideo(video) : null,
+      gpsCheck: buildGpsCheck(dispute.request, video),
+      queryThreads,
+      postSubmissionChat,
+    };
   },
 
   /** Dispute Dashboard statistics. */

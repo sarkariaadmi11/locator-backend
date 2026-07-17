@@ -56,6 +56,21 @@ export const moderationHistoryQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(100).default(20),
 });
 
+// Pre-publish Pending Requests queue (PRD §5.9.2, §5.14.7) — distinct entity/param name
+// (`requestId`) from the video queue's `videoId` above.
+export const pendingRequestsQuerySchema = z.object({
+  page: z.coerce.number().int().positive().default(1),
+  limit: z.coerce.number().int().positive().max(100).default(20),
+});
+
+export const pendingRequestIdParamsSchema = z.object({
+  requestId: z.string().min(1),
+});
+
+export const rejectPendingRequestSchema = z.object({
+  reason: z.string().trim().min(3, 'A reason is required.').max(500),
+});
+
 export const bulkVideoIdsSchema = z.object({
   videoIds: z.array(z.string().min(1)).min(1, 'At least one video must be selected.').max(50),
 });

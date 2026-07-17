@@ -17,8 +17,8 @@ export const adminController = {
   },
 
   async me(req: AdminRequest, res: Response) {
-    const {id, email, name} = req.admin!;
-    sendSuccess(res, 200, 'Admin fetched.', {id, email, name});
+    const {id, email, name, role} = req.admin!;
+    sendSuccess(res, 200, 'Admin fetched.', {id, email, name, role});
   },
 
   async getDashboard(_req: Request, res: Response) {
@@ -50,13 +50,33 @@ export const adminController = {
     sendSuccess(res, 200, 'Users fetched.', data);
   },
 
+  async getUserDetail(req: AdminRequest, res: Response) {
+    const data = await adminService.getUserDetail(req.params.id as string);
+    sendSuccess(res, 200, 'User detail fetched.', data);
+  },
+
+  async adjustWallet(req: AdminRequest, res: Response) {
+    const {type, bucket, amount, reason} = req.body as {
+      type: 'CREDITS' | 'CONNECTS';
+      bucket?: 'bonus' | 'purchased' | 'earned';
+      amount: number;
+      reason: string;
+    };
+    const data = await adminService.adjustWallet(req.admin!.id, req.params.id as string, {type, bucket, amount, reason});
+    sendSuccess(res, 200, 'Wallet adjusted.', data);
+  },
+
   async toggleBlock(req: AdminRequest, res: Response) {
-    const data = await adminService.toggleBlock(req.admin!.id, req.params.id as string);
+    const data = await adminService.toggleBlock(req.admin!.id, req.params.id as string, req.body.reason as string);
     sendSuccess(res, 200, 'User block status updated.', data);
   },
 
   async toggleSuspicious(req: AdminRequest, res: Response) {
-    const data = await adminService.toggleSuspicious(req.admin!.id, req.params.id as string);
+    const data = await adminService.toggleSuspicious(
+      req.admin!.id,
+      req.params.id as string,
+      req.body.reason as string,
+    );
     sendSuccess(res, 200, 'User suspicious status updated.', data);
   },
 
@@ -68,6 +88,20 @@ export const adminController = {
     const status = req.query.status as string | undefined;
     const data = await adminService.listTransactions(page, limit, userId, type, status);
     sendSuccess(res, 200, 'Transactions fetched.', data);
+  },
+
+  /** Live Monitoring alert feed (PRD §5.14.2). */
+  async listAlerts(req: Request, res: Response) {
+    const limit = Number(req.query.limit) || 50;
+    const data = await adminService.listAlerts(limit);
+    sendSuccess(res, 200, 'Alerts fetched.', data);
+  },
+
+  /** Ledger reconciliation report (PRD §5.14.5) — recent nightly `ledgerReconciliationJob` runs. */
+  async listLedgerReconciliation(req: Request, res: Response) {
+    const limit = Number(req.query.limit) || 20;
+    const data = await adminService.listLedgerReconciliation(limit);
+    sendSuccess(res, 200, 'Ledger reconciliation runs fetched.', data);
   },
 
   async exportTransactions(_req: Request, res: Response) {

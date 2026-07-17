@@ -1,10 +1,5 @@
 import {z} from 'zod';
 
-// Account Deletion & Data Export (PRD §9, backend Phase 13).
-export const deleteAccountRequestSchema = z.object({
-  reason: z.string().trim().max(500).optional(),
-});
-
 export const complianceConfigKeyParamsSchema = z.object({
   key: z.string().min(1),
 });

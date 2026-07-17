@@ -1,4 +1,4 @@
-import {Prisma, RequestStatus} from '@prisma/client';
+import {Prisma, RequestCategory, RequestStatus} from '@prisma/client';
 
 import {prisma} from '../prisma/client';
 
@@ -13,6 +13,14 @@ export const requestRepository = {
 
   findByIdForUser(id: string, userId: string) {
     return prisma.request.findFirst({where: {id, requesterId: userId}});
+  },
+
+  /** Pre-publish Pending Requests queue detail (PRD §5.9.2) — includes requester summary. */
+  findByIdWithRequester(id: string) {
+    return prisma.request.findUnique({
+      where: {id},
+      include: {requester: {select: {id: true, name: true, username: true, email: true}}},
+    });
   },
 
   findManyForRequester(requesterId: string, status: RequestStatus | undefined, skip: number, take: number) {
@@ -30,6 +38,21 @@ export const requestRepository = {
 
   update(id: string, data: Prisma.RequestUpdateInput) {
     return prisma.request.update({where: {id}, data});
+  },
+
+  /** Pre-publish Pending Requests queue (PRD §5.9.2, §5.14.7) — oldest-first, per spec. */
+  findManyByStatus(status: RequestStatus, skip: number, take: number) {
+    return prisma.request.findMany({
+      where: {status},
+      orderBy: {createdAt: 'asc'},
+      skip,
+      take,
+      include: {requester: {select: {id: true, name: true, username: true, email: true}}},
+    });
+  },
+
+  countByStatus(status: RequestStatus) {
+    return prisma.request.count({where: {status}});
   },
 
   /** Used by the expiry sweep — only rows still eligible are touched, race-safe via updateMany. */
@@ -104,7 +127,9 @@ export const requestRepository = {
   }) {
     return prisma.request.findMany({
       where: {
-        status: 'PUBLISHED',
+        // MATCHING_WINDOW included (backend Phase 4 item 4) — a Highest Rated request's
+        // "searching" state, otherwise nearby Creators could never discover it to respond.
+        status: {in: ['PUBLISHED', 'MATCHING_WINDOW']},
         requesterId: {not: params.excludeUserId},
         expiresAt: {gt: params.now},
         latitude: {gte: params.minLat, lte: params.maxLat},
@@ -177,10 +202,40 @@ export const requestRepository = {
   findAcceptanceTimerExpired(now: Date) {
     return prisma.request.findMany({
       where: {
-        status: 'TEMPORARY_CHAT',
+        // CREATOR_ASSIGNED is the v2.1 resting state a Creator sits in until Start Recording
+        // (backend Phase 4 item 2 — TEMPORARY_CHAT retired from the accept flow). TEMPORARY_CHAT
+        // is included too so any pre-existing row from before this change still resolves.
+        status: {in: ['CREATOR_ASSIGNED', 'TEMPORARY_CHAT']},
         acceptanceTimerExpiresAt: {lte: now},
       },
-      select: {id: true, creatorId: true, requesterId: true},
+      select: {id: true, creatorId: true, requesterId: true, status: true},
+    });
+  },
+
+  /** Highest Rated matching windows whose response period has elapsed — swept by matchingWindowJob. */
+  findMatchingWindowDue(now: Date) {
+    return prisma.request.findMany({
+      where: {
+        status: 'MATCHING_WINDOW',
+        matchingWindowClosesAt: {lte: now},
+      },
+      select: {id: true, requesterId: true, latitude: true, longitude: true, radiusMeters: true, category: true},
+    });
+  },
+
+  /**
+   * Estimated Response Time (PRD_TRD_SUMMARY.md §3.3, §10 item 8, backend Phase 3/mobile Phase
+   * 9) — the last `sampleSize` requests in this category that actually got accepted, most recent
+   * first, so the caller can average `acceptedAt - requesterDeclarationAt`. Deliberately not
+   * geo-scoped (no per-city/per-radius breakdown) — a simple category-level global average,
+   * flagged as a scoped-down v1 versus a more precise location-aware estimate.
+   */
+  findRecentAcceptedForCategory(category: RequestCategory, sampleSize: number) {
+    return prisma.request.findMany({
+      where: {category, acceptedAt: {not: null}},
+      orderBy: {acceptedAt: 'desc'},
+      take: sampleSize,
+      select: {requesterDeclarationAt: true, acceptedAt: true},
     });
   },
 
@@ -243,6 +298,29 @@ export const requestRepository = {
     });
   },
 
+  /** Still REQUESTER_REVIEW, not yet warned, past the 42h auto-accept-warning threshold (v2.1, backend Phase 3 item 5). */
+  findAutoAcceptWarningCandidates(olderThan: Date) {
+    return prisma.request.findMany({
+      where: {
+        status: 'REQUESTER_REVIEW',
+        moderatorDecisionAt: {lte: olderThan},
+        autoAcceptWarningSentAt: null,
+      },
+      select: {id: true, requesterId: true},
+    });
+  },
+
+  /** Still REQUESTER_REVIEW past the 48h auto-accept threshold (v2.1, backend Phase 3 item 5). */
+  findAutoAcceptCandidates(olderThan: Date) {
+    return prisma.request.findMany({
+      where: {
+        status: 'REQUESTER_REVIEW',
+        moderatorDecisionAt: {lte: olderThan},
+      },
+      select: {id: true, requesterId: true},
+    });
+  },
+
   /** COMPLETED, not yet reminded, past the rating-reminder threshold — filtered for missing ratings in the service layer. */
   findRatingReminderCandidates(olderThan: Date) {
     return prisma.request.findMany({
@@ -277,9 +355,28 @@ export const requestRepository = {
     return prisma.request.count({where: {status: {notIn: terminalStatuses}}});
   },
 
+  /** Live Monitoring map pins (PRD §5.14.2 "Map view of active pins") — capped, coordinates only. */
+  findActivePins(terminalStatuses: RequestStatus[], limit: number) {
+    return prisma.request.findMany({
+      where: {status: {notIn: terminalStatuses}},
+      select: {id: true, latitude: true, longitude: true, status: true, category: true},
+      take: limit,
+    });
+  },
+
   /** Requests created since `since` (for "Total Requests Today", PRD §5.14.1). */
   countCreatedSince(since: Date) {
     return prisma.request.count({where: {createdAt: {gte: since}}});
+  },
+
+  /**
+   * COMPLETED requests fulfilled by `creatorId` — Verified Creator Badge's `completedCount`
+   * (backend Phase 7). Matches on `creatorId`, not `lastAssignedCreatorId`, since only a
+   * genuinely-completed request should count (a timed-out/abandoned acceptance never reaches
+   * COMPLETED and nulls `creatorId` via the acceptance-timer sweep, correctly excluding it).
+   */
+  countCompletedForCreator(creatorId: string) {
+    return prisma.request.count({where: {creatorId, status: 'COMPLETED'}});
   },
 
   /**

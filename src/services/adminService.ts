@@ -1,11 +1,15 @@
 import {Prisma, RequestStatus} from '@prisma/client';
 
 import {prisma} from '../prisma/client';
+import {adminAlertRepository} from '../repositories/adminAlertRepository';
+import {ledgerReconciliationRunRepository} from '../repositories/ledgerReconciliationRunRepository';
 import {payoutRequestRepository} from '../repositories/payoutRequestRepository';
+import {refreshTokenRepository} from '../repositories/refreshTokenRepository';
 import {requestRepository} from '../repositories/requestRepository';
 import {transactionRepository} from '../repositories/transactionRepository';
 import {adminAuditLogService} from './adminAuditLogService';
 import {disputeService} from './disputeService';
+import {ledgerService} from './ledgerService';
 import {moderationService} from './moderationService';
 import {notificationService} from './notificationService';
 import {NotificationType} from './notificationTypes';
@@ -98,7 +102,7 @@ export const adminService = {
    * parallel aggregation logic.
    */
   async getLiveMonitoring() {
-    const [grouped, onlineCreators, moderationStats, disputeStats, flaggedChats] = await Promise.all([
+    const [grouped, onlineCreators, moderationStats, disputeStats, flaggedChats, pins] = await Promise.all([
       requestRepository.countGroupedByLiveStatus(TERMINAL_STATUSES as RequestStatus[]),
       prisma.user.count({where: {availabilityStatus: 'ONLINE'}}),
       moderationService.getStats(),
@@ -106,6 +110,9 @@ export const adminService = {
       prisma.request.count({
         where: {chatFlaggedForReview: true, status: {notIn: TERMINAL_STATUSES as RequestStatus[]}},
       }),
+      // Live Monitoring map view (PRD §5.14.2 "Map view of active pins") — capped at 500 so the
+      // payload stays bounded even with a large active-request volume.
+      requestRepository.findActivePins(TERMINAL_STATUSES as RequestStatus[], 500),
     ]);
 
     const countByStatus = new Map(grouped.map(row => [row.status, row.count]));
@@ -122,6 +129,7 @@ export const adminService = {
       openDisputes: disputeStats.open,
       underReviewDisputes: disputeStats.underReview,
       flaggedChats,
+      activePins: pins.map(p => ({id: p.id, latitude: p.latitude, longitude: p.longitude, status: p.status, category: p.category})),
       generatedAt: new Date().toISOString(),
     };
   },
@@ -201,6 +209,85 @@ export const adminService = {
   },
 
   /**
+   * `GET /admin/users/:id` — full profile drill-down (admin frontend Phase 6, PRD §5.14.4):
+   * balance breakdown (both currency systems), request/fulfilment counts, rating summary,
+   * Verified Creator status, report count. Read-only aggregate, no new tables.
+   */
+  async getUserDetail(userId: string) {
+    const user = await prisma.user.findUnique({where: {id: userId}});
+    if (!user) throw new HttpError(404, 'User not found.');
+
+    const [
+      balances,
+      requestsCreatedCount,
+      requestsFulfilledCount,
+      ratingAgg,
+      verifiedStatus,
+      reportsReceivedCount,
+    ] = await Promise.all([
+      ledgerService.getBalances(userId),
+      prisma.request.count({where: {requesterId: userId}}),
+      prisma.request.count({where: {creatorId: userId, status: {in: ['COMPLETED', 'PAYMENT_RELEASED', 'TIPPING']}}}),
+      prisma.rating.aggregate({where: {rateeId: userId}, _avg: {stars: true}, _count: {stars: true}}),
+      prisma.verifiedCreatorStatus.findUnique({where: {userId}}),
+      prisma.report.count({where: {reportedUserId: userId}}),
+    ]);
+
+    return {
+      ...presentUser(user),
+      balances,
+      requestsCreatedCount,
+      requestsFulfilledCount,
+      averageRating: ratingAgg._avg.stars,
+      ratingCount: ratingAgg._count.stars,
+      isVerifiedCreator: !!verifiedStatus?.isVerified,
+      reportsReceivedCount,
+    };
+  },
+
+  /**
+   * `PATCH /admin/users/:id/wallet-adjustment` — manual Credit/Connect adjustment (admin
+   * frontend Phase 6, PRD §5.14.4), mandatory reason, audit-logged. `amount` may be negative
+   * (debit) or positive (credit); `bucket` only applies to CREDITS (defaults `bonus`, the same
+   * bucket signup/promotional grants use) and is ignored for CONNECTS.
+   */
+  async adjustWallet(
+    adminId: string,
+    userId: string,
+    input: {type: 'CREDITS' | 'CONNECTS'; bucket?: 'bonus' | 'purchased' | 'earned'; amount: number; reason: string},
+  ) {
+    if (input.amount === 0) {
+      throw new HttpError(400, 'Adjustment amount must not be zero.');
+    }
+
+    const magnitude = Math.abs(input.amount);
+    const isCredit = input.amount > 0;
+
+    if (input.type === 'CREDITS') {
+      if (isCredit) {
+        await ledgerService.creditCredits(userId, magnitude, input.bucket ?? 'bonus', 'ADMIN_ADJUSTMENT', {
+          actorId: adminId,
+        });
+      } else {
+        await ledgerService.debitCredits(userId, magnitude, 'ADMIN_ADJUSTMENT', {actorId: adminId});
+      }
+    } else if (isCredit) {
+      await ledgerService.creditConnects(userId, magnitude, 'ADMIN_ADJUSTMENT', {actorId: adminId});
+    } else {
+      await ledgerService.debitConnects(userId, magnitude, 'ADMIN_ADJUSTMENT', {actorId: adminId});
+    }
+
+    await adminAuditLogService.log(adminId, 'WALLET_MANUAL_ADJUSTMENT', 'User', userId, {
+      type: input.type,
+      bucket: input.bucket,
+      amount: input.amount,
+      reason: input.reason,
+    });
+
+    return ledgerService.getBalances(userId);
+  },
+
+  /**
    * Audit Logs backfill (PRD §5.14.7, backend Phase 11) — `AdminAuditLog` previously only
    * recorded Moderation/Escrow/Dispute/Compliance actions (each added alongside its own
    * feature). User block/suspicious toggles predate `AdminAuditLog`'s existence (backend Phase
@@ -208,7 +295,7 @@ export const adminService = {
    * toggles that were never logged — this closes the gap going forward, the same "backfill"
    * scope every other pre-existing-action audit gap in this codebase has meant.
    */
-  async toggleBlock(adminId: string, userId: string) {
+  async toggleBlock(adminId: string, userId: string, reason: string) {
     const user = await prisma.user.findUnique({where: {id: userId}});
     if (!user) throw new HttpError(404, 'User not found.');
 
@@ -217,9 +304,16 @@ export const adminService = {
       data: {isActive: !user.isActive},
     });
 
-    await adminAuditLogService.log(adminId, updated.isActive ? 'USER_UNBLOCKED' : 'USER_BLOCKED', 'User', userId);
+    await adminAuditLogService.log(adminId, updated.isActive ? 'USER_UNBLOCKED' : 'USER_BLOCKED', 'User', userId, {
+      reason,
+    });
 
     if (!updated.isActive) {
+      // Suspension must kill any session already in the user's hands, not just future logins —
+      // otherwise a suspended user with a still-valid access/refresh token keeps working for up
+      // to 24h (see authMiddleware's isActive check, which only runs per-request; the refresh
+      // token itself has no such check without this).
+      await refreshTokenRepository.revokeAllForUser(userId);
       await notificationService.notifyUser(
         userId,
         NotificationType.ACCOUNT_SUSPENDED,
@@ -231,7 +325,36 @@ export const adminService = {
     return presentUser(updated);
   },
 
-  async toggleSuspicious(adminId: string, userId: string) {
+  /**
+   * Time-boxed suspension (PRD §5.9.2 "Suspend User button (reason + duration)") — the
+   * Moderator-queue-specific action, distinct from `toggleBlock`'s plain indefinite toggle.
+   * Reuses the same session-kill/notify behavior `toggleBlock` uses for `isActive: false`.
+   * `retentionJob`'s sweep auto-reactivates the account once `suspendedUntil` elapses.
+   */
+  async suspendUser(adminId: string, userId: string, reason: string, durationHours: number) {
+    const user = await prisma.user.findUnique({where: {id: userId}});
+    if (!user) throw new HttpError(404, 'User not found.');
+
+    const suspendedUntil = new Date(Date.now() + durationHours * 60 * 60 * 1000);
+    const updated = await prisma.user.update({
+      where: {id: userId},
+      data: {isActive: false, suspendedUntil},
+    });
+
+    await adminAuditLogService.log(adminId, 'USER_SUSPENDED', 'User', userId, {reason, durationHours, suspendedUntil});
+
+    await refreshTokenRepository.revokeAllForUser(userId);
+    await notificationService.notifyUser(
+      userId,
+      NotificationType.ACCOUNT_SUSPENDED,
+      'Account Suspended',
+      `Your account has been suspended by a Moderator for ${durationHours} hours. Contact support for details.`,
+    );
+
+    return presentUser(updated);
+  },
+
+  async toggleSuspicious(adminId: string, userId: string, reason: string) {
     const user = await prisma.user.findUnique({where: {id: userId}});
     if (!user) throw new HttpError(404, 'User not found.');
 
@@ -245,6 +368,7 @@ export const adminService = {
       updated.isSuspicious ? 'USER_FLAGGED_SUSPICIOUS' : 'USER_UNFLAGGED_SUSPICIOUS',
       'User',
       userId,
+      {reason},
     );
 
     return presentUser(updated);
@@ -303,6 +427,32 @@ export const adminService = {
     );
 
     return header + rows.join('\n');
+  },
+
+  /** Live Monitoring alert feed (PRD §5.14.2). */
+  async listAlerts(limit: number) {
+    const alerts = await adminAlertRepository.findRecent(limit);
+    return alerts.map(a => ({
+      id: a.id,
+      type: a.type,
+      message: a.message,
+      metadata: a.metadata,
+      userId: a.userId,
+      requestId: a.requestId,
+      createdAt: a.createdAt.toISOString(),
+    }));
+  },
+
+  /** Ledger reconciliation report (PRD §5.14.5) — recent nightly `ledgerReconciliationJob` runs. */
+  async listLedgerReconciliation(limit: number) {
+    const runs = await ledgerReconciliationRunRepository.findRecent(limit);
+    return runs.map(run => ({
+      id: run.id,
+      checkedCount: run.checkedCount,
+      varianceCount: run.varianceCount,
+      variances: run.variances,
+      createdAt: run.createdAt.toISOString(),
+    }));
   },
 
   async listPayouts(page: number, limit: number, status?: string) {

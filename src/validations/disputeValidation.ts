@@ -32,7 +32,16 @@ export const DISPUTE_ALLOWED_SOURCE_STATUSES = [
   'PAYMENT_RELEASED',
   'COMPLETED',
   'REJECTED',
+  // Admin/Moderator "Escalate to Dispute Center" only (admin frontend Phase 3, backend Phase 5
+  // item 6) — never reachable from a participant's own `POST /disputes`, since a normal
+  // Requester/Creator has no dispute-raising action while a video is still under moderation.
+  'MODERATOR_REVIEW',
 ] as const;
+
+export const adminEscalateDisputeSchema = z.object({
+  reason: z.enum(DISPUTE_REASONS).default('OTHER'),
+  description: z.string().trim().min(10, 'Please describe the issue in at least 10 characters.').max(1000),
+});
 
 export const createDisputeSchema = z.object({
   requestId: z.string().min(1),

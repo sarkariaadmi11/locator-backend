@@ -66,7 +66,7 @@ export const creatorService = {
       requestRepository.findActiveForCreator(userId),
       requestRepository.findAcceptedForCreator(userId, DASHBOARD_ACCEPTED_PREVIEW_LIMIT),
       ratingService.getSummaryForUser(userId),
-      trustScoreService.getProfile(userId, 'creator'),
+      trustScoreService.getUserFacingProfile(userId, 'creator'),
     ]);
 
     return {

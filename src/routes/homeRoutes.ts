@@ -7,3 +7,4 @@ import {authenticate} from '../middlewares/authMiddleware';
 export const homeRoutes = Router();
 
 homeRoutes.get('/', authenticate, asyncHandler(homeController.index));
+homeRoutes.get('/moderation-status', authenticate, asyncHandler(homeController.moderationStatus));

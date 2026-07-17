@@ -42,15 +42,33 @@ function uploadToCloudinary(buffer: Buffer): Promise<{secure_url: string}> {
 
 export const profileService = {
   async update(userId: string, input: ProfileInput) {
-    const usernameOwner = await userRepository.findByUsername(input.username);
-    if (usernameOwner && usernameOwner.id !== userId) {
-      throw new HttpError(409, 'Username is already taken.');
+    const currentUser = await userRepository.findById(userId);
+    if (!currentUser) {
+      throw new HttpError(404, 'User not found.');
+    }
+
+    // v2.1 public-identity model (PRD_TRD_SUMMARY.md §4.2, §10 item 1, backend Phase 8 item 8):
+    // @username is the sole public identifier, so changing it has real consequences (every
+    // participant-facing surface re-renders under a new handle) — enforced as a one-time change,
+    // not unlimited edits. Comparison is case-insensitive to match `findByUsername`'s unique
+    // index (this codebase's username uniqueness is already case-insensitive).
+    const isActualUsernameChange = input.username.toLowerCase() !== currentUser.username.toLowerCase();
+    if (isActualUsernameChange && currentUser.usernameChangedCount >= 1) {
+      throw new HttpError(409, 'Username can only be changed once. Contact support if you need another change.');
+    }
+
+    if (isActualUsernameChange) {
+      const usernameOwner = await userRepository.findByUsername(input.username);
+      if (usernameOwner && usernameOwner.id !== userId) {
+        throw new HttpError(409, 'Username is already taken.');
+      }
     }
 
     const user = await userRepository.update(userId, {
       bio: input.bio || null,
       name: input.name,
       username: input.username,
+      ...(isActualUsernameChange ? {usernameChangedCount: {increment: 1}} : {}),
     });
 
     return presentUser(user);

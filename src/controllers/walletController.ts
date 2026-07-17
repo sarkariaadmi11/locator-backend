@@ -21,6 +21,11 @@ function verifyWebhookSignature(rawBody: Buffer | undefined, signature: string |
 }
 
 export const walletController = {
+  async getWallet(req: AuthenticatedRequest, res: Response) {
+    const data = await walletService.getWallet(req.user!.id);
+    sendSuccess(res, 200, 'Wallet fetched.', data);
+  },
+
   async createOrder(req: AuthenticatedRequest, res: Response) {
     const data = await walletService.createOrder(req.user!.id, req.body.amount);
     sendSuccess(res, 200, 'Order created.', data);

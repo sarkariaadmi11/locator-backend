@@ -94,12 +94,16 @@ export const consentService = {
   },
 
   /**
-   * `POST /account/welcome-video-ack` (PRD §5.11b.3) — mobile calls this once it has re-shown
-   * the welcome video after `User.welcomeVideoRepromptPending` flipped true (3 consecutive
-   * Requester rejections — see `requesterReviewService.reject`), clearing the flag so the video
-   * doesn't reappear on every subsequent app open.
+   * `POST /account/welcome-video-ack` (PRD §5.11b.3) — mobile calls this both the first time it
+   * shows the welcome video to a new user (stamping `welcomeVideoSeenAt`) and any time it
+   * re-shows it after `User.welcomeVideoRepromptPending` flipped true (3 consecutive Requester
+   * rejections — see `requesterReviewService.reject`), clearing that flag so the video doesn't
+   * reappear on every subsequent app open.
    */
   async acknowledgeWelcomeVideoReprompt(userId: string) {
-    await userRepository.update(userId, {welcomeVideoRepromptPending: false});
+    await userRepository.update(userId, {
+      welcomeVideoRepromptPending: false,
+      welcomeVideoSeenAt: new Date(),
+    });
   },
 };

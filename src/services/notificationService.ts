@@ -1,4 +1,5 @@
 import {prisma} from '../prisma/client';
+import {notificationTemplateRepository} from '../repositories/notificationTemplateRepository';
 import {fcmService} from './fcmService';
 import {
   NOTIFICATION_TYPE_CATEGORY,
@@ -35,6 +36,23 @@ async function isCategoryEnabled(userId: string, type: NotificationTypeValue): P
   return user.notifyPlatformAlerts;
 }
 
+/**
+ * Notification Templates (PRD §5.14.9) — additive override. If an `enabled` template row exists
+ * for this type, its title/body wins verbatim; otherwise the caller's literal title/body (every
+ * existing call site, unchanged) is used as-is. No call site needs to change for this to work.
+ */
+async function applyTemplate(
+  type: NotificationTypeValue,
+  title: string,
+  body: string,
+): Promise<{title: string; body: string}> {
+  const template = await notificationTemplateRepository.findByType(type);
+  if (template?.enabled) {
+    return {title: template.title, body: template.body};
+  }
+  return {title, body};
+}
+
 export const notificationService = {
   /** Send to one user, honoring their category preference (safety-critical types bypass it). */
   async notifyUser(
@@ -47,7 +65,8 @@ export const notificationService = {
     const enabled = await isCategoryEnabled(userId, type);
     if (!enabled) return;
 
-    await fcmService.sendToUser(userId, {title, body, data: {...data, type}});
+    const resolved = await applyTemplate(type, title, body);
+    await fcmService.sendToUser(userId, {title: resolved.title, body: resolved.body, data: {...data, type}});
   },
 
   /** Fan out to many users (e.g. nearby-creator broadcast), each gated by their own preference. */
@@ -63,6 +82,7 @@ export const notificationService = {
 
   /** Admin alerts — push-only (no `Notification` row; Admins aren't `User` rows), never preference-gated. */
   async notifyAdmins(type: NotificationTypeValue, title: string, body: string, data?: NotifyData): Promise<void> {
-    await fcmService.sendToAllAdmins({title, body, data: {...data, type}});
+    const resolved = await applyTemplate(type, title, body);
+    await fcmService.sendToAllAdmins({title: resolved.title, body: resolved.body, data: {...data, type}});
   },
 };

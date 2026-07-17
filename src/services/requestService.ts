@@ -1,6 +1,8 @@
-import {RequestCategory, RequestStatus, RequestType} from '@prisma/client';
+import {AcceptanceMode, RequestCategory, RequestStatus, RequestType} from '@prisma/client';
 
+import {BETA_ECONOMY_DEFAULTS} from '../config/betaEconomy';
 import {env} from '../config/env';
+import {adminAlertRepository} from '../repositories/adminAlertRepository';
 import {requestRepository} from '../repositories/requestRepository';
 import {userRepository} from '../repositories/userRepository';
 import {haversineMeters} from '../utils/geo';
@@ -10,11 +12,15 @@ import {consentService} from './consentService';
 import {creatorLockKey, creatorLockService} from './creatorLockService';
 import {creatorMatchingService, NearbyFilters} from './creatorMatchingService';
 import {escrowService} from './escrowService';
+import {gpsSpoofingService} from './gpsSpoofingService';
+import {ledgerService} from './ledgerService';
 import {locationCategoryService} from './locationCategoryService';
 import {notificationService} from './notificationService';
 import {NotificationType} from './notificationTypes';
 import {placesService} from './placesService';
+import {queryService} from './queryService';
 import {ratingService} from './ratingService';
+import {SettingsKey, settingsService} from './settingsService';
 import {trustScoreService} from './trustScoreService';
 import {
   REQUEST_EXPIRY_HOURS,
@@ -33,6 +39,9 @@ type CreateRequestInput = {
   rewardAmount: number;
   category: RequestCategory;
   instructions?: string;
+  // Highest Rated acceptance mode (PRD_TRD_SUMMARY.md §5.6, backend Phase 4 item 4) — optional,
+  // defaults to FIRST_ACCEPTED (unchanged existing behaviour) when omitted.
+  acceptanceMode?: AcceptanceMode;
 };
 
 type UpdateRequestInput = Partial<{
@@ -71,6 +80,42 @@ export async function notifyEligibleCreatorsOfNewRequest(request: Awaited<Return
 }
 
 /**
+ * Shared publish path — DRAFT -> PUBLISHED (moderation OFF, called directly from `create`) or
+ * PENDING_MODERATION -> PUBLISHED (moderation ON, called from `moderationService.approveRequest`
+ * once a Moderator/Admin approves). Handles the Highest Rated matching-window branch and the
+ * eligible-creator broadcast identically either way, so the two entry points can never drift.
+ */
+export async function publishFromDraft(
+  requestId: string,
+  fromStatus: RequestStatus,
+  acceptanceMode: AcceptanceMode,
+) {
+  assertTransition(fromStatus, 'PUBLISHED');
+  const published = await requestRepository.update(requestId, {status: 'PUBLISHED'});
+
+  // Highest Rated acceptance mode (backend Phase 4 item 4) — the request's "searching" state
+  // is MATCHING_WINDOW, not PUBLISHED itself; the window closes on its own via
+  // matchingWindowJob's sweep (see matchingWindowService.closeWindow), which falls back to
+  // FIRST_ACCEPTED/PUBLISHED if nobody responds in time.
+  if (acceptanceMode === 'HIGHEST_RATED') {
+    assertTransition('PUBLISHED', 'MATCHING_WINDOW');
+    const windowSeconds = await settingsService.getNumber(
+      SettingsKey.HIGHEST_RATED_WINDOW_SECONDS,
+      BETA_ECONOMY_DEFAULTS.HIGHEST_RATED_WINDOW_SECONDS,
+    );
+    const inWindow = await requestRepository.update(requestId, {
+      status: 'MATCHING_WINDOW',
+      matchingWindowClosesAt: new Date(Date.now() + windowSeconds * 1000),
+    });
+    await notifyEligibleCreatorsOfNewRequest(inWindow);
+    return presentRequest(inWindow);
+  }
+
+  await notifyEligibleCreatorsOfNewRequest(published);
+  return presentRequest(published);
+}
+
+/**
  * Creator Discovery (nearby/available feeds) shows only the Requester's trust profile — these
  * lists are `PUBLISHED`-only (pre-acceptance, see creatorMatchingService/findAvailable), so
  * there's never a Creator side to show yet.
@@ -78,8 +123,10 @@ export async function notifyEligibleCreatorsOfNewRequest(request: Awaited<Return
 async function attachRequesterTrustProfile<T extends object>(
   base: T,
   request: {requesterId: string},
-): Promise<T & {requesterTrustProfile: Awaited<ReturnType<typeof trustScoreService.getProfile>>}> {
-  const requesterTrustProfile = await trustScoreService.getProfile(request.requesterId, 'requester');
+) {
+  // User-facing feed (Creator Discovery) — must use the trust-score-stripped variant (v2.1,
+  // backend Phase 7). See trustScoreService.ts's stripTrustScoreForUser doc comment.
+  const requesterTrustProfile = await trustScoreService.getUserFacingProfile(request.requesterId, 'requester');
   return {...base, requesterTrustProfile};
 }
 
@@ -101,15 +148,36 @@ async function resolveFormattedAddress(
 
 export const requestService = {
   async create(requesterId: string, input: CreateRequestInput) {
-    // Escrow reservation (backend Phase 8) debits the full reward amount up front, so a
-    // requester without sufficient funds is blocked before a Request row (or its escrow) ever
-    // exists — checked here, ahead of the atomic reserve, to avoid an orphaned Request on
-    // insufficient balance (see escrowService.reserve for the actual debit).
     const requester = await userRepository.findById(requesterId);
     if (!requester) {
       throw new HttpError(404, 'User not found.');
     }
-    if (Number(requester.walletBalance) < input.rewardAmount) {
+
+    // v2.1 Beta Mode vs. real-money mode (PRD_TRD_SUMMARY.md §1, §5.3.1, backend Phase 2 item 5).
+    // "Reward Amount and Request Cost are mutually exclusive" (PRD §5.3.1) — when real money is
+    // disabled (the v2.1 default), the client-supplied `rewardAmount` is ignored entirely and
+    // the fixed, admin-configurable Request Cost is used instead; the field is read-only in the
+    // Beta UI. High-value manual review is explicitly "not applicable in Beta Mode — Request
+    // Cost is fixed" (PRD §5.3.1), so it's skipped for CREDIT-mode requests below.
+    const currencyMode: 'CREDIT' | 'INR' = env.ENABLE_REAL_MONEY ? 'INR' : 'CREDIT';
+    const escrowAmount =
+      currencyMode === 'CREDIT'
+        ? await settingsService.getNumber(SettingsKey.REQUEST_COST_CREDITS, BETA_ECONOMY_DEFAULTS.REQUEST_COST_CREDITS)
+        : input.rewardAmount;
+
+    // Escrow reservation (backend Phase 8) debits the full amount up front, so a requester
+    // without sufficient funds is blocked before a Request row (or its escrow) ever exists —
+    // checked here, ahead of the atomic reserve, to avoid an orphaned Request on insufficient
+    // balance (see escrowService.reserve for the actual debit).
+    if (currencyMode === 'CREDIT') {
+      const balances = await ledgerService.getBalances(requesterId);
+      if (balances.videoCredits < escrowAmount) {
+        throw new HttpError(
+          402,
+          `You need ${escrowAmount} Credits to post this request. You have ${balances.videoCredits}.`,
+        );
+      }
+    } else if (Number(requester.walletBalance) < escrowAmount) {
       throw new HttpError(402, 'Insufficient wallet balance to reserve escrow for this request.');
     }
 
@@ -128,7 +196,9 @@ export const requestService = {
       classification.reverseGeocode?.formattedAddress,
     );
 
-    const highValueReviewRequired = input.rewardAmount >= REQUEST_HIGH_VALUE_THRESHOLD;
+    // High-value manual review is not applicable in Beta/CREDIT mode (PRD §5.3.1) — Request
+    // Cost is fixed, so there's nothing "high-value" about it.
+    const highValueReviewRequired = currencyMode === 'INR' && escrowAmount >= REQUEST_HIGH_VALUE_THRESHOLD;
     const now = new Date();
 
     // Scheduled requests stay searchable for REQUEST_EXPIRY_HOURS from the moment they're
@@ -149,7 +219,9 @@ export const requestService = {
       radiusMeters: input.radiusMeters,
       description: input.description,
       durationMinutes: input.durationMinutes,
-      rewardAmount: input.rewardAmount,
+      rewardAmount: escrowAmount,
+      currencyMode,
+      acceptanceMode: input.acceptanceMode ?? 'FIRST_ACCEPTED',
       category: input.category,
       instructions: input.instructions,
       highValueReviewRequired,
@@ -158,7 +230,7 @@ export const requestService = {
       status: 'DRAFT',
     });
 
-    await escrowService.reserve(created.id, requesterId, input.rewardAmount);
+    await escrowService.reserve(created.id, requesterId, escrowAmount, currencyMode);
 
     // Immutable consent audit row (PRD §9.1, §5.7.3, backend Phase 13) — additive alongside the
     // `requesterDeclarationAt` timestamp stamped above (Phase 2's interim substitute, unchanged).
@@ -168,7 +240,7 @@ export const requestService = {
       requesterId,
       NotificationType.REQUEST_CREATED,
       'Request created',
-      `Your request for ₹${input.rewardAmount} has been created.`,
+      `Your request for ${currencyMode === 'CREDIT' ? `${escrowAmount} Credits` : `₹${escrowAmount}`} has been created.`,
       {requestId: created.id, screen: 'RequestDetail'},
     );
     if (input.type === 'SCHEDULED' && input.scheduledAt) {
@@ -181,22 +253,35 @@ export const requestService = {
       );
     }
     if (highValueReviewRequired) {
+      const message = `A request worth ₹${input.rewardAmount} requires Admin review before publishing.`;
       await notificationService.notifyAdmins(
         NotificationType.HIGH_VALUE_ESCROW,
         'High-value request pending review',
-        `A request worth ₹${input.rewardAmount} requires Admin review before publishing.`,
+        message,
         {requestId: created.id},
       );
+      // Live Monitoring alert feed (PRD §5.14.2 "high-value requests").
+      await adminAlertRepository.create({
+        type: 'HIGH_VALUE_ESCROW',
+        message,
+        metadata: {rewardAmount: input.rewardAmount},
+        requestId: created.id,
+      });
     }
 
-    // Immediate, non-high-value requests publish straight away; SCHEDULED and high-value
-    // requests stay DRAFT (the former until scheduledAt via the sweep job, the latter
-    // pending mandatory Admin review — Phase 6, not yet built — see MASTER_EXECUTION_PLAN.md).
+    // Immediate, non-high-value requests publish straight away when Moderation is OFF; when ON,
+    // they wait in the Pending Requests queue (PRD §5.9.2/§5.14.7) for a Moderator/Admin to
+    // approve first — `moderationService.approveRequest` calls `publishFromDraft` below, the
+    // same publish path this takes when moderation is OFF. SCHEDULED and high-value requests
+    // stay DRAFT regardless (the former until scheduledAt via the sweep job, the latter pending
+    // mandatory Admin review — Phase 6, not yet built — see MASTER_EXECUTION_PLAN.md).
     if (input.type === 'IMMEDIATE' && !highValueReviewRequired) {
-      assertTransition('DRAFT', 'PUBLISHED');
-      const published = await requestRepository.update(created.id, {status: 'PUBLISHED'});
-      await notifyEligibleCreatorsOfNewRequest(published);
-      return presentRequest(published);
+      if (await settingsService.isModerationEnabled()) {
+        assertTransition('DRAFT', 'PENDING_MODERATION');
+        const pending = await requestRepository.update(created.id, {status: 'PENDING_MODERATION'});
+        return presentRequest(pending);
+      }
+      return publishFromDraft(created.id, 'DRAFT', created.acceptanceMode);
     }
 
     return presentRequest(created);
@@ -230,10 +315,16 @@ export const requestService = {
       throw new HttpError(409, 'Only a request still in DRAFT can be edited.');
     }
 
+    // Request Cost is fixed and read-only in Beta/CREDIT mode (PRD §5.3.1) — only a real-money
+    // request's Reward Amount can be edited pre-publish.
+    if (request.currencyMode === 'CREDIT' && data.rewardAmount !== undefined) {
+      throw new HttpError(400, 'Request Cost is fixed in Beta Mode and cannot be edited.');
+    }
+
     const rewardAmount = data.rewardAmount ?? Number(request.rewardAmount);
     const updated = await requestRepository.update(id, {
       ...data,
-      highValueReviewRequired: rewardAmount >= REQUEST_HIGH_VALUE_THRESHOLD,
+      highValueReviewRequired: request.currencyMode === 'INR' && rewardAmount >= REQUEST_HIGH_VALUE_THRESHOLD,
     });
 
     return presentRequest(updated);
@@ -284,9 +375,9 @@ export const requestService = {
     }
 
     // Idempotent acceptance: the same Creator retrying (e.g. a lost response after a network
-    // blip) sees the same success result, not a false conflict. CREATOR_ASSIGNED is transient
-    // (this same call advances it straight to TEMPORARY_CHAT below), so a retry will usually
-    // observe TEMPORARY_CHAT rather than CREATOR_ASSIGNED.
+    // blip) sees the same success result, not a false conflict. CREATOR_ASSIGNED is now the
+    // settled resting state until Start Recording (v2.1, backend Phase 4 item 2) — TEMPORARY_CHAT
+    // is still checked here too so a retry against a pre-existing row in that state still no-ops.
     if (
       (request.status === 'CREATOR_ASSIGNED' || request.status === 'TEMPORARY_CHAT') &&
       request.creatorId === creatorId
@@ -315,6 +406,34 @@ export const requestService = {
     const creator = await userRepository.findById(creatorId);
     if (!creator || creator.availabilityStatus !== 'ONLINE') {
       throw new HttpError(403, 'You must be Online to accept requests.');
+    }
+
+    // Abandonment guard (PRD_TRD_SUMMARY.md §5.8, backend Phase 8 item 3) — 3 acceptance-timer
+    // expiries in a rolling 30 days blocks new Accepts for 24h (set by acceptanceTimerJob).
+    if (creator.acceptanceBlockedUntil && creator.acceptanceBlockedUntil.getTime() > Date.now()) {
+      throw new HttpError(
+        403,
+        `You've missed the recording window too many times recently. You can accept new requests again after ${creator.acceptanceBlockedUntil.toISOString()}.`,
+      );
+    }
+
+    // Accept Request Cost (PRD_TRD_SUMMARY.md §7.3, "Accept Request Cost = 1 Connect") — was
+    // schema/settings-only until this fix (`SettingsKey.ACCEPT_REQUEST_CONNECTS` existed but was
+    // never actually read on Accept). Pre-check here so a Creator without enough Connects is
+    // rejected before ever taking the Redis lock; the actual debit happens after the DB-level
+    // race is won below, so a losing Creator in a First Accepted race is never charged.
+    let acceptCost = 0;
+    if (request.currencyMode === 'CREDIT') {
+      acceptCost = await settingsService.getNumber(
+        SettingsKey.ACCEPT_REQUEST_CONNECTS,
+        BETA_ECONOMY_DEFAULTS.ACCEPT_REQUEST_CONNECTS,
+      );
+      if (creator.creatorConnects < acceptCost) {
+        throw new HttpError(
+          402,
+          `You need ${acceptCost} Connect(s) to accept a request. You have ${creator.creatorConnects}.`,
+        );
+      }
     }
 
     const distanceMeters = haversineMeters(
@@ -358,6 +477,25 @@ export const requestService = {
         throw new HttpError(409, 'This request has already been accepted by another creator.');
       }
 
+      if (acceptCost > 0) {
+        try {
+          await ledgerService.debitConnects(creatorId, acceptCost, 'ACCEPT_SPEND', {requestId: id});
+        } catch (debitErr) {
+          // Balance changed between the pre-check above and this debit (e.g. spent elsewhere in
+          // the same instant) — roll back the assignment rather than leave a Creator holding a
+          // request they couldn't actually pay to accept.
+          await requestRepository.updateStatusIfCurrently(id, 'CREATOR_ASSIGNED', {
+            status: 'PUBLISHED',
+            creatorId: null,
+            lastAssignedCreatorId: null,
+            acceptedAt: null,
+            acceptanceTimerExpiresAt: null,
+          });
+          await creatorLockService.release(lockKey, token);
+          throw debitErr;
+        }
+      }
+
       updated = await requestRepository.findById(id);
     } catch (err) {
       if (!(err instanceof HttpError)) {
@@ -366,11 +504,14 @@ export const requestService = {
       throw err;
     }
 
-    // Chat opens automatically the instant GPS-validated acceptance completes (PRD §5.4).
-    // The row is no longer PUBLISHED and is exclusively owned by this Creator at this point,
-    // so this is a plain transition, not a race-guarded conditional update.
-    assertTransition('CREATOR_ASSIGNED', 'TEMPORARY_CHAT');
-    updated = await requestRepository.update(id, {status: 'TEMPORARY_CHAT'});
+    // v2.1 (backend Phase 4 item 2, paired with Phase 3 item 3): CREATOR_ASSIGNED is now the
+    // resting state until Start Recording — the old TEMPORARY_CHAT interstitial is retired from
+    // this flow. All open Pre-Acceptance Query threads close the instant a Creator is assigned
+    // (PRD §5.4.0/§5.4.1 "all open query threads on this request close"), whichever Creator won.
+    await queryService.closeAllForRequest(id);
+
+    // GPS spoofing signal (backend Phase 8 item 2) — flag-and-queue only, never blocks Accept.
+    gpsSpoofingService.checkAndFlag(creatorId, creatorLocation.latitude, creatorLocation.longitude, 'accept').catch(() => {});
 
     await notificationService.notifyUser(
       request.requesterId,
@@ -380,24 +521,31 @@ export const requestService = {
       {requestId: id, screen: 'RequestDetail'},
     );
 
-    // Chat opens automatically the instant acceptance completes (PRD §5.4) — notify both
-    // participants it's available now.
-    await notificationService.notifyUser(
-      request.requesterId,
-      NotificationType.CHAT_OPENED,
-      'Chat opened',
-      'You can now chat with your Creator until recording starts.',
-      {requestId: id, screen: 'Chat'},
-    );
-    await notificationService.notifyUser(
-      creatorId,
-      NotificationType.CHAT_OPENED,
-      'Chat opened',
-      'You can now chat with the Requester until you start recording.',
-      {requestId: id, screen: 'Chat'},
-    );
-
     return presentRequest(updated!);
+  },
+
+  /**
+   * `GET /requests/estimated-response-time` (PRD_TRD_SUMMARY.md §3.3, §10 item 8) — shown on
+   * Create Request before posting. Averages the last `SAMPLE_SIZE` accepted requests in the same
+   * category; falls back to a fixed default when there isn't enough history yet (a brand-new
+   * category, or Beta launch day with too few accepted requests to be a meaningful average).
+   */
+  async estimatedResponseTimeMinutes(category: RequestCategory) {
+    const SAMPLE_SIZE = 50;
+    const FALLBACK_MINUTES = 5;
+    const MIN_SAMPLES = 5;
+
+    const recent = await requestRepository.findRecentAcceptedForCategory(category, SAMPLE_SIZE);
+    if (recent.length < MIN_SAMPLES) {
+      return {estimatedMinutes: FALLBACK_MINUTES, sampleSize: recent.length, isEstimate: true};
+    }
+
+    const totalMs = recent.reduce(
+      (sum, r) => sum + (r.acceptedAt!.getTime() - r.requesterDeclarationAt.getTime()),
+      0,
+    );
+    const avgMinutes = Math.round(totalMs / recent.length / 60_000);
+    return {estimatedMinutes: Math.max(1, avgMinutes), sampleSize: recent.length, isEstimate: false};
   },
 
   // --- Discovery (Creator side, PRD §5.5, §5.11) -----------------------------------------
@@ -473,7 +621,10 @@ export const requestService = {
     const presented = {
       ...presentRequest(request, distanceMeters),
       isOwnRequest: request.requesterId === creatorId,
-      isLocked: request.status !== 'PUBLISHED' && request.status !== 'DRAFT',
+      // MATCHING_WINDOW (backend Phase 4 item 4) is a Highest Rated request's own "searching"
+      // state, same as PUBLISHED — not locked to anyone yet, so it must not read as "already
+      // accepted by another creator" the way CREATOR_ASSIGNED+ does.
+      isLocked: request.status !== 'PUBLISHED' && request.status !== 'DRAFT' && request.status !== 'MATCHING_WINDOW',
       isVisible: creatorMatchingService.isVisibleToCreator(request, creatorId),
     };
     const withRatings = await ratingService.attachRatingSummaries(presented, request);

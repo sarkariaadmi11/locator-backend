@@ -262,9 +262,29 @@ async function buildTrustProfile(userId: string, role: 'requester' | 'creator') 
 
 export type TrustProfile = Awaited<ReturnType<typeof buildTrustProfile>>;
 
+/**
+ * v2.1 (PRD_TRD_SUMMARY.md §5/§10 item 2, backend Phase 7): "Trust Score removed from MVP
+ * display entirely." Strips the composite `trustScore` number from a profile before it reaches
+ * any user-facing endpoint — every individual underlying data point (rating, completion %,
+ * cancellation %, response rate, account age, Verified Creator badge) is exactly what v2.1's
+ * Trust Profile *is*, so nothing else changes. Internal/Admin-only consumers (`adminList` etc.)
+ * keep the full `TrustProfile` including `trustScore`, per this item's own decision that an
+ * internal risk signal is defensible as long as it never round-trips to a regular user.
+ */
+function stripTrustScoreForUser(profile: TrustProfile): Omit<TrustProfile, 'trustScore'> {
+  const {trustScore: _trustScore, ...rest} = profile;
+  return rest;
+}
+
 export const trustScoreService = {
   async getProfile(userId: string, role: 'requester' | 'creator'): Promise<TrustProfile> {
     return buildTrustProfile(userId, role);
+  },
+
+  /** User-facing variant of `getProfile` — every mobile-reachable endpoint must use this, never `getProfile` directly. */
+  async getUserFacingProfile(userId: string, role: 'requester' | 'creator') {
+    const profile = await buildTrustProfile(userId, role);
+    return stripTrustScoreForUser(profile);
   },
 
   /**
@@ -300,16 +320,11 @@ export const trustScoreService = {
       );
     }
 
+    // v2.1 (backend Phase 7): Trust Score is removed from user-facing display entirely, so a
+    // "Your Trust Score is now X" notification is no longer sent — the score-change tracking
+    // below is kept only as harmless bookkeeping (avoids a schema migration to drop the column)
+    // and to preserve the "first-ever fetch" condition newlyEarned/badge tracking already relied on.
     const scoreChanged = user.lastNotifiedTrustScore !== null && user.lastNotifiedTrustScore !== profile.trustScore;
-    if (scoreChanged) {
-      await notificationService.notifyUser(
-        userId,
-        NotificationType.TRUST_SCORE_UPDATED,
-        'Trust Score Updated',
-        `Your Trust Score is now ${profile.trustScore}.`,
-        {screen: 'TrustProfile'},
-      );
-    }
 
     if (newlyEarned.length > 0 || scoreChanged || user.lastNotifiedTrustScore === null) {
       await userRepository.update(userId, {
@@ -329,10 +344,10 @@ export const trustScoreService = {
   async attachTrustSummaries<T extends object>(
     base: T,
     request: {requesterId: string; creatorId: string | null},
-  ): Promise<T & {requesterTrustProfile: TrustProfile; creatorTrustProfile: TrustProfile | null}> {
+  ) {
     const [requesterTrustProfile, creatorTrustProfile] = await Promise.all([
-      this.getProfile(request.requesterId, 'requester'),
-      request.creatorId ? this.getProfile(request.creatorId, 'creator') : Promise.resolve(null),
+      this.getUserFacingProfile(request.requesterId, 'requester'),
+      request.creatorId ? this.getUserFacingProfile(request.creatorId, 'creator') : Promise.resolve(null),
     ]);
     return {...base, requesterTrustProfile, creatorTrustProfile};
   },

@@ -16,6 +16,14 @@ export const presentRequest = (request: Request, distanceMeters?: number) => ({
   description: request.description,
   durationMinutes: request.durationMinutes,
   rewardAmount: Number(request.rewardAmount),
+  // v2.1 (backend Phase 2/9, PRD_TRD_SUMMARY.md §4.5) — the client needs this to know whether
+  // `rewardAmount` (and tipping, etc.) is denominated in Credits or INR; was never exposed here
+  // before despite existing on the Request model since Phase 1.
+  currencyMode: request.currencyMode,
+  acceptanceMode: request.acceptanceMode,
+  // Highest Rated matching window (backend Phase 4 item 4) — null once the window closes either
+  // way (winner assigned, or fallback to FIRST_ACCEPTED).
+  matchingWindowClosesAt: request.matchingWindowClosesAt?.toISOString() ?? null,
   category: request.category,
   instructions: request.instructions,
   status: request.status,

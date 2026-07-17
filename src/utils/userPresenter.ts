@@ -5,6 +5,8 @@ export const presentUser = (user: User) => ({
   name: user.name,
   username: user.username,
   email: user.email,
+  phone: user.phone,
+  phoneVerifiedAt: user.phoneVerifiedAt?.toISOString() ?? null,
   profileImage: user.profileImage,
   bio: user.bio,
   city: user.city,
@@ -18,6 +20,7 @@ export const presentUser = (user: User) => ({
   // account-deletion status, so mobile's auth-gate/Privacy Settings can react without a second
   // round-trip. `consecutiveRejections` itself is engineering bookkeeping, not shown in the UI.
   welcomeVideoRepromptPending: user.welcomeVideoRepromptPending,
+  welcomeVideoSeenAt: user.welcomeVideoSeenAt?.toISOString() ?? null,
   deletionRequestedAt: user.deletionRequestedAt?.toISOString() ?? null,
   deletionScheduledFor: user.deletionScheduledFor?.toISOString() ?? null,
   createdAt: user.createdAt.toISOString(),
