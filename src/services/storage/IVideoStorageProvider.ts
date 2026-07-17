@@ -7,6 +7,10 @@
 export type VideoUploadOptions = {
   requestId: string;
   videoId: string;
+  // Passed through so a provider that can't itself inspect the video (e.g. a local dev mock with
+  // no real transcoder) can still return sensible metadata instead of inventing values.
+  mimeType: string;
+  durationSeconds: number;
 };
 
 export type VideoUploadResult = {

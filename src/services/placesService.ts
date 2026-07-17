@@ -39,6 +39,7 @@ export type ReverseGeocodeResult = {
   placeId: string;
   latitude: number;
   longitude: number;
+  city: string | null;
 };
 
 export type PlacesSearchResult = {
@@ -76,11 +77,32 @@ type GooglePlaceDetailsResponse = {
   };
 };
 
+type GoogleAddressComponent = {long_name: string; short_name: string; types: string[]};
+
 type GoogleGeocodeResponse = {
   status: string;
   error_message?: string;
-  results?: {formatted_address: string; place_id: string; geometry?: {location?: {lat: number; lng: number}}}[];
+  results?: {
+    formatted_address: string;
+    place_id: string;
+    geometry?: {location?: {lat: number; lng: number}};
+    address_components?: GoogleAddressComponent[];
+  }[];
 };
+
+// Google doesn't return a single "city" field — derive one from address_components, preferring
+// `locality` (the common case) and falling back to broader administrative levels for addresses
+// that don't have one (e.g. resolve to an unincorporated area).
+const CITY_COMPONENT_TYPES = ['locality', 'administrative_area_level_2', 'administrative_area_level_3'];
+
+function extractCity(components: GoogleAddressComponent[] | undefined): string | null {
+  if (!components) return null;
+  for (const type of CITY_COMPONENT_TYPES) {
+    const match = components.find(c => c.types.includes(type));
+    if (match) return match.long_name;
+  }
+  return null;
+}
 
 function requireApiKey(): string {
   if (!env.GOOGLE_PLACES_API_KEY) {
@@ -254,6 +276,7 @@ export const placesService = {
       placeId: first.place_id,
       latitude: first.geometry?.location?.lat ?? params.lat,
       longitude: first.geometry?.location?.lng ?? params.lng,
+      city: extractCity(first.address_components),
     };
 
     reverseGeocodeCache.set(cacheKey, result, REVERSE_GEOCODE_TTL_MS);

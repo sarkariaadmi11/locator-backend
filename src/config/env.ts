@@ -48,9 +48,19 @@ const envSchema = z.object({
     .optional()
     .transform(v => v === 'true')
     .default(false),
-  CLOUDINARY_CLOUD_NAME: z.string().min(1),
-  CLOUDINARY_API_KEY: z.string().min(1),
-  CLOUDINARY_API_SECRET: z.string().min(1),
+  CLOUDINARY_CLOUD_NAME: z.string().default(''),
+  CLOUDINARY_API_KEY: z.string().default(''),
+  CLOUDINARY_API_SECRET: z.string().default(''),
+  // Temporary dev/test convenience (not in PRD/TRD, same pattern as MOCK_OTP): saves uploaded
+  // request videos to local disk (served from UPLOAD_DIR) instead of calling Cloudinary, so the
+  // recording→upload→moderation→completion flow can be live-tested with a synthetic video file
+  // that a real transcoder would otherwise reject. Hard-disabled outside development below.
+  // Production/staging always use CloudinaryVideoStorageProvider (or its future S3 replacement).
+  MOCK_VIDEO_STORAGE: z
+    .string()
+    .optional()
+    .transform(v => v === 'true')
+    .default(false),
   ADMIN_NAME: z.string().default('Admin'),
   ADMIN_EMAIL: z.string().email(),
   ADMIN_PASSWORD: z.string().min(8),
@@ -90,6 +100,10 @@ if (baseEnv.NODE_ENV === 'production') {
   if (!baseEnv.MSG91_AUTH_KEY || !baseEnv.MSG91_SENDER_ID) missing.push('MSG91_AUTH_KEY/MSG91_SENDER_ID');
   if (!baseEnv.RAZORPAY_WEBHOOK_SECRET) missing.push('RAZORPAY_WEBHOOK_SECRET');
   if (!baseEnv.FIREBASE_SERVICE_ACCOUNT_PATH) missing.push('FIREBASE_SERVICE_ACCOUNT_PATH');
+  if (!baseEnv.CLOUDINARY_CLOUD_NAME || !baseEnv.CLOUDINARY_API_KEY || !baseEnv.CLOUDINARY_API_SECRET) {
+    missing.push('CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET');
+  }
+  if (baseEnv.MOCK_VIDEO_STORAGE) missing.push('MOCK_VIDEO_STORAGE (must not be true in production)');
   if (baseEnv.CORS_ORIGIN === '*') missing.push('CORS_ORIGIN (must not be "*" in production)');
   if (baseEnv.ADMIN_PASSWORD === 'change-me-please') missing.push('ADMIN_PASSWORD (still the .env.example default)');
 
@@ -106,4 +120,6 @@ export const env = {
   // Hard safety net: MOCK_OTP never activates outside development, even if the flag is left
   // set by mistake in a staging/production .env.
   MOCK_OTP_ENABLED: baseEnv.MOCK_OTP && baseEnv.NODE_ENV === 'development',
+  // Same hard safety net for the local video storage mock.
+  MOCK_VIDEO_STORAGE_ENABLED: baseEnv.MOCK_VIDEO_STORAGE && baseEnv.NODE_ENV === 'development',
 };

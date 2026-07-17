@@ -177,7 +177,12 @@ export const recordingService = {
 
     let uploadResult;
     try {
-      uploadResult = await videoStorageProvider.uploadVideo(file.buffer, {requestId, videoId});
+      uploadResult = await videoStorageProvider.uploadVideo(file.buffer, {
+        requestId,
+        videoId,
+        mimeType: file.mimetype,
+        durationSeconds: metadata.durationSeconds,
+      });
     } catch (err) {
       const attempts = video.uploadAttempts + 1;
       const failureReason = (err as Error).message ?? 'Upload failed.';

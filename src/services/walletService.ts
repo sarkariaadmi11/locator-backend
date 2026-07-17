@@ -1,10 +1,12 @@
 import crypto from 'crypto';
 
+import {LedgerReasonCode} from '@prisma/client';
 import Razorpay from 'razorpay';
 
 import {env} from '../config/env';
 import {logger} from '../config/logger';
 import {prisma} from '../prisma/client';
+import {ledgerRepository} from '../repositories/ledgerRepository';
 import {payoutRequestRepository} from '../repositories/payoutRequestRepository';
 import {transactionRepository} from '../repositories/transactionRepository';
 import {ledgerService} from './ledgerService';
@@ -25,6 +27,23 @@ function assertRealMoneyEnabled() {
     throw new HttpError(403, 'Real-money wallet features are disabled in Beta Mode.');
   }
 }
+
+// Human-readable labels for the Wallet screen's merged transaction feed (see getTransactions).
+const LEDGER_REASON_LABELS: Record<LedgerReasonCode, string> = {
+  SIGNUP_BONUS: 'Signup bonus',
+  DAILY_CONNECT_BONUS: 'Daily free Connects',
+  REQUEST_HOLD: 'Request posted',
+  REQUEST_REFUND: 'Request refunded',
+  ACCEPT_SPEND: 'Request accepted',
+  ACCEPT_REFUND: 'Accept refunded',
+  CREATOR_REWARD: 'Creator reward',
+  TIP_SENT: 'Tip sent',
+  TIP_RECEIVED: 'Tip received',
+  ADMIN_ADJUSTMENT: 'Admin adjustment',
+  COMMISSION_DEDUCTION: 'Commission deducted',
+  PAYOUT: 'Payout',
+  TOP_UP: 'Top-up',
+};
 
 const razorpay = new Razorpay({
   key_id: env.RAZORPAY_KEY_ID,
@@ -315,29 +334,57 @@ export const walletService = {
     return {message: 'Payout request submitted. An admin will process it shortly.'};
   },
 
+  // Merges two separate ledgers into the one feed the Wallet screen renders (PRD "per-currency
+  // transaction history"): `Transaction` (Razorpay-backed INR top-up/withdraw) and `LedgerEntry`
+  // (Credit/Connect movements — signup bonus, daily grants, request spend/refund, etc.). Both are
+  // legitimate, independently-written sources; nothing here changes how either is written.
+  // Cross-table pagination: fetching the top `skip+limit` rows from each source (sorted desc) and
+  // merge-sorting is sufficient to correctly produce any page — the true top-N merged rows can
+  // never come from beyond the top-N of each individual source.
   async getTransactions(userId: string, page: number, limit: number) {
     const skip = (page - 1) * limit;
-    const where = {userId, status: 'SUCCESS' as const};
+    const fetchCount = skip + limit;
+    const txnWhere = {userId, status: 'SUCCESS' as const};
 
-    const [rows, total] = await Promise.all([
+    const [txnRows, txnTotal, ledgerRows, ledgerTotal] = await Promise.all([
       transactionRepository.findMany({
-        where,
+        where: txnWhere,
         orderBy: {createdAt: 'desc'},
-        skip,
-        take: limit,
+        take: fetchCount,
         select: {id: true, type: true, amount: true, description: true, requestId: true, createdAt: true},
       }),
-      transactionRepository.count(where),
+      transactionRepository.count(txnWhere),
+      ledgerRepository.findManyForUser(userId, {skip: 0, take: fetchCount}),
+      ledgerRepository.countForUser(userId),
     ]);
 
-    return {
-      items: rows.map(t => ({
-        ...t,
+    const merged = [
+      ...txnRows.map(t => ({
+        id: t.id,
+        type: t.type as 'CREDIT' | 'DEBIT',
+        currency: 'INR' as const,
         amount: Number(t.amount),
-        createdAt: t.createdAt.toISOString(),
+        description: t.description,
+        requestId: t.requestId,
+        createdAt: t.createdAt,
       })),
+      ...ledgerRows.map(l => ({
+        id: l.id,
+        type: (l.direction === 'CREDIT' ? 'CREDIT' : 'DEBIT') as 'CREDIT' | 'DEBIT',
+        currency: l.currency,
+        amount: l.amount,
+        description: LEDGER_REASON_LABELS[l.reasonCode] ?? l.reasonCode,
+        requestId: l.requestId,
+        createdAt: l.createdAt,
+      })),
+    ].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+
+    const page_ = merged.slice(skip, skip + limit);
+
+    return {
+      items: page_.map(t => ({...t, createdAt: t.createdAt.toISOString()})),
       page,
-      hasMore: skip + rows.length < total,
+      hasMore: skip + page_.length < txnTotal + ledgerTotal,
     };
   },
 };
