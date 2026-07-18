@@ -38,8 +38,11 @@ async function bootstrap() {
   const checks = await runStartupChecks();
 
   if (!checks.database.ok) {
-    logger.error(`Database connection failed — refusing to start. Reason: ${checks.database.reason}`);
-    process.exit(1);
+    if (env.NODE_ENV === 'production') {
+      logger.error(`Database connection failed — refusing to start. Reason: ${checks.database.reason}`);
+      process.exit(1);
+    }
+    logger.warn(`Database connection failed — starting in degraded mode. Reason: ${checks.database.reason}`);
   }
 
   await seedAdmins();
