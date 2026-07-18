@@ -65,6 +65,7 @@ const envSchema = z.object({
   ADMIN_EMAIL: z.string().email(),
   ADMIN_PASSWORD: z.string().min(8),
   FIREBASE_SERVICE_ACCOUNT_PATH: z.string().optional(),
+  FIREBASE_SERVICE_ACCOUNT_JSON: z.string().optional(),
   GOOGLE_PLACES_API_KEY: z.string().optional(),
   REDIS_URL: z.string().min(1).default('redis://127.0.0.1:6379'),
   // PRD §5.5 [REVIEW — suggested 15 min]. Configurable rather than hardcoded per
