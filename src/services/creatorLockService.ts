@@ -8,14 +8,9 @@ import {redis} from '../config/redis';
  * exactly one Creator can win a race to accept the same Request, and by the acceptance-timer
  * job to auto-release a Creator who never starts recording in time.
  *
- * `acquire` is a single atomic `SET key value NX PX ttl` — Redis guarantees this is race-free
- * across processes/instances, which a DB-row-with-unique-constraint approach can't give the
- * TTL-based auto-expiry the PRD requires without a separate expiry sweep racing the DB write.
- *
- * `release` uses a compare-and-delete Lua script (atomic GET+DEL) keyed on a random token
- * generated at `acquire` time, so a process can only release a lock it currently holds — a
- * stale/expired lock that Redis already evicted and someone else re-acquired is never
- * accidentally deleted by the original holder's late `release` call.
+ * When Redis is unavailable (e.g. free Render tier without Redis), falls back to an in-process
+ * in-memory lock. This works correctly for single-instance deployments; multi-instance
+ * deployments need a shared Redis instance.
  */
 export type CreatorLockService = {
   /** Atomically acquire `key` for `ttlMs`. Returns a release token, or null if already held. */
@@ -40,6 +35,45 @@ else
 end
 `;
 
+class InMemoryLockService implements CreatorLockService {
+  private locks = new Map<string, {token: string; expiresAt: number}>();
+
+  private isExpired(entry: {token: string; expiresAt: number}): boolean {
+    return Date.now() >= entry.expiresAt;
+  }
+
+  async acquire(key: string, ttlMs: number): Promise<string | null> {
+    const existing = this.locks.get(key);
+    if (existing && !this.isExpired(existing)) {
+      return null;
+    }
+    const token = crypto.randomUUID();
+    this.locks.set(key, {token, expiresAt: Date.now() + ttlMs});
+    return token;
+  }
+
+  async release(key: string, token: string): Promise<void> {
+    const existing = this.locks.get(key);
+    if (existing && existing.token === token) {
+      this.locks.delete(key);
+    }
+  }
+
+  async forceRelease(key: string): Promise<void> {
+    this.locks.delete(key);
+  }
+
+  async isLocked(key: string): Promise<boolean> {
+    const existing = this.locks.get(key);
+    if (!existing) return false;
+    if (this.isExpired(existing)) {
+      this.locks.delete(key);
+      return false;
+    }
+    return true;
+  }
+}
+
 class RedisLockService implements CreatorLockService {
   async acquire(key: string, ttlMs: number): Promise<string | null> {
     const token = crypto.randomUUID();
@@ -61,6 +95,43 @@ class RedisLockService implements CreatorLockService {
   }
 }
 
+function tryRedis(): boolean {
+  try {
+    return redis.status === 'ready';
+  } catch {
+    return false;
+  }
+}
+
+class FallbackLockService implements CreatorLockService {
+  private redisService = new RedisLockService();
+  private memoryService = new InMemoryLockService();
+
+  private useRedis(): boolean {
+    return tryRedis();
+  }
+
+  private delegate(): CreatorLockService {
+    return this.useRedis() ? this.redisService : this.memoryService;
+  }
+
+  acquire(key: string, ttlMs: number): Promise<string | null> {
+    return this.delegate().acquire(key, ttlMs);
+  }
+
+  release(key: string, token: string): Promise<void> {
+    return this.delegate().release(key, token);
+  }
+
+  forceRelease(key: string): Promise<void> {
+    return this.delegate().forceRelease(key);
+  }
+
+  isLocked(key: string): Promise<boolean> {
+    return this.delegate().isLocked(key);
+  }
+}
+
 export const creatorLockKey = (requestId: string): string => `request:${requestId}:creator-lock`;
 
-export const creatorLockService: CreatorLockService = new RedisLockService();
+export const creatorLockService: CreatorLockService = new FallbackLockService();
