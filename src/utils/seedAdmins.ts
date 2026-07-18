@@ -3,6 +3,13 @@ import {env} from '../config/env';
 import {prisma} from '../prisma/client';
 
 export async function seedAdmins() {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+  } catch {
+    console.log('  ↳ Skipped (database unavailable)');
+    return;
+  }
+
   console.log('Seeding admins…');
 
   const existing = await prisma.admin.findUnique({where: {email: env.ADMIN_EMAIL}});
