@@ -12,18 +12,22 @@ export async function seedAdmins() {
 
   console.log('Seeding admins…');
 
-  const existing = await prisma.admin.findUnique({where: {email: env.ADMIN_EMAIL}});
+  try {
+    const existing = await prisma.admin.findUnique({where: {email: env.ADMIN_EMAIL}});
 
-  if (existing) {
-    console.log(`  ↳ Skipped (already exists): ${env.ADMIN_EMAIL}`);
-    return;
+    if (existing) {
+      console.log(`  ↳ Skipped (already exists): ${env.ADMIN_EMAIL}`);
+      return;
+    }
+
+    const passwordHash = await bcrypt.hash(env.ADMIN_PASSWORD, 12);
+    const created = await prisma.admin.create({
+      data: {name: env.ADMIN_NAME, email: env.ADMIN_EMAIL, password: passwordHash},
+    });
+
+    console.log(`  ↳ Created: ${created.email} (id: ${created.id})`);
+    console.log('Done.');
+  } catch (err) {
+    console.log(`  ↳ Skipped (${(err as Error).message})`);
   }
-
-  const passwordHash = await bcrypt.hash(env.ADMIN_PASSWORD, 12);
-  const created = await prisma.admin.create({
-    data: {name: env.ADMIN_NAME, email: env.ADMIN_EMAIL, password: passwordHash},
-  });
-
-  console.log(`  ↳ Created: ${created.email} (id: ${created.id})`);
-  console.log('Done.');
 }
